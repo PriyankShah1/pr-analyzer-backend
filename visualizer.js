@@ -1,92 +1,115 @@
+
 /**
- * Converts parsed flows into React Flow compatible nodes and edges.
- * Single nodeMap used for both node generation and edge linking — no ID mismatch.
+ * visualizer.js
+ * Converts flows into React Flow nodes + edges.
+ * Now supports deleted and broken dependency node types.
  */
 
 const KNOWN_FACADES = new Set([
-  'Cache', 'DB', 'Mail', 'Log', 'Event', 'Queue',
-  'Storage', 'Redis', 'Http', 'Bus', 'Auth', 'Hash',
-  'Session', 'Config', 'Artisan'
+  'Cache','DB','Mail','Log','Event','Queue','Storage',
+  'Redis','Http','Bus','Auth','Hash','Session','Config','Artisan'
 ]);
 
 function getNodeType(name) {
-  if (name.startsWith('Route:'))      return 'route';
-  if (name.startsWith('Middleware:')) return 'middleware';
+  if (name.startsWith('Route:'))       return 'route';
+  if (name.startsWith('Middleware:'))  return 'middleware';
+  if (name.startsWith('Model:'))       return 'model';
   if (/^[A-Z]\w+::/.test(name)) {
     const className = name.split('::')[0];
     return KNOWN_FACADES.has(className) ? 'facade' : 'model';
   }
-  if (name.includes('Controller'))    return 'controller';
+  if (name.includes('Controller'))     return 'controller';
   if (name.includes('Repository') || name.includes('Repo')) return 'repository';
-  if (name.includes('Service'))       return 'service';
-  if (name.includes('Job'))           return 'job';
-  if (name.includes('Event'))         return 'event';
+  if (name.includes('Service'))        return 'service';
+  if (name.includes('Job'))            return 'job';
+  if (name.includes('Event'))          return 'event';
   if (name.includes('Client') || name.includes('Breaker')) return 'client';
   return 'service';
 }
 
 function deduplicateFlows(flows) {
   const uniqueFlows = new Map();
-
   flows.forEach(flow => {
     const key = `${flow.from}→${flow.to}`;
     if (!uniqueFlows.has(key)) {
       uniqueFlows.set(key, flow);
-    } else if (flow.mismatch && !uniqueFlows.get(key).mismatch) {
-      // Prefer the mismatch version if duplicate
+    } else if ((flow.mismatch || flow.brokenDependency) && !uniqueFlows.get(key).mismatch) {
       uniqueFlows.set(key, flow);
     }
   });
-
   return Array.from(uniqueFlows.values());
 }
 
-function buildVisualizationResponse(flows) {
+function buildVisualizationResponse(flows, deletedClasses = []) {
   const deduplicatedFlows = deduplicateFlows(flows);
+  const deletedSet = new Set(deletedClasses);
 
-  // ── Step 1: Collect all unique node names ──────────────────────────────────
+  // ── Step 1: Collect unique node names ────────────────────────────────────
   const uniqueNodeNames = [];
   const seenNames = new Set();
 
   deduplicatedFlows.forEach(flow => {
-    if (!seenNames.has(flow.from)) {
-      seenNames.add(flow.from);
-      uniqueNodeNames.push(flow.from);
-    }
-    if (!seenNames.has(flow.to)) {
-      seenNames.add(flow.to);
-      uniqueNodeNames.push(flow.to);
+    [flow.from, flow.to].forEach(name => {
+      if (!seenNames.has(name)) {
+        seenNames.add(name);
+        uniqueNodeNames.push(name);
+      }
+    });
+  });
+
+  // Also add deleted classes as standalone nodes if they were referenced
+  deletedClasses.forEach(className => {
+    if (!seenNames.has(className)) {
+      seenNames.add(className);
+      uniqueNodeNames.push(className);
     }
   });
 
-  // ── Step 2: Build nodeMap (label → id) — single source of truth ───────────
+  // ── Step 2: Build nodeMap ─────────────────────────────────────────────────
   const nodeMap = new Map();
   uniqueNodeNames.forEach((name, index) => {
     nodeMap.set(name, String(index + 1));
   });
 
-  // ── Step 3: Build nodes using nodeMap ─────────────────────────────────────
-  const nodesWithMismatches = new Set();
+  // ── Step 3: Determine node states ────────────────────────────────────────
+  const nodesWithMismatches      = new Set();
+  const nodesWithBrokenDeps      = new Set();
+  const nodesWithDeletedSource   = new Set();
+
   deduplicatedFlows.forEach(flow => {
-    if (flow.mismatch) {
-      nodesWithMismatches.add(flow.from);
-      nodesWithMismatches.add(flow.to);
-    }
+    if (flow.mismatch)          { nodesWithMismatches.add(flow.from); nodesWithMismatches.add(flow.to); }
+    if (flow.brokenDependency)  { nodesWithBrokenDeps.add(flow.to); }
+    if (flow.deletedSource)     { nodesWithDeletedSource.add(flow.from); }
   });
 
+  // ── Step 4: Build nodes ───────────────────────────────────────────────────
   const nodesPerRow = Math.max(1, Math.ceil(Math.sqrt(uniqueNodeNames.length)));
 
   const nodes = uniqueNodeNames.map((name, index) => {
     const id = nodeMap.get(name);
     const hasMismatch = nodesWithMismatches.has(name);
 
+    // Determine node type — deleted takes priority
+    const rawClass = name.includes('@')
+      ? name.split('@')[0]
+      : name.split('::')[0];
+
+    let nodeType = getNodeType(name);
+    if (deletedSet.has(rawClass) || deletedSet.has(name)) {
+      nodeType = 'deleted';
+    } else if (nodesWithBrokenDeps.has(name)) {
+      nodeType = 'broken';
+    }
+
     return {
       id,
       type: 'custom',
       data: {
-        label: name,
-        type: getNodeType(name), // ✅ proper type detection
+        label:      name,
+        type:       nodeType,
         hasMismatch,
+        isDeleted:  nodeType === 'deleted',
+        isBroken:   nodeType === 'broken',
       },
       position: {
         x: (index % nodesPerRow) * 350,
@@ -95,46 +118,70 @@ function buildVisualizationResponse(flows) {
     };
   });
 
-  // ── Step 4: Build edges using same nodeMap ─────────────────────────────────
+  // ── Step 5: Build edges ───────────────────────────────────────────────────
   const edges = deduplicatedFlows.map((flow, index) => {
     const sourceId = nodeMap.get(flow.from);
     const targetId = nodeMap.get(flow.to);
 
-    const isMismatch = flow.mismatch || false;
-    const returnType = flow.returnType || 'unknown';
+    const isMismatch       = flow.mismatch         || false;
+    const isBroken         = flow.brokenDependency || false;
+    const isDeletedSource  = flow.deletedSource    || false;
+    const returnType       = flow.returnType        || 'unknown';
+
+    // Color priority: broken > mismatch > deleted source > normal
+    let strokeColor = '#94a3b8';
+    let edgeLabel   = returnType;
+
+    if (isBroken) {
+      strokeColor = '#f97316'; // orange for broken dependency
+      edgeLabel   = `${returnType} 💥`;
+    } else if (isMismatch) {
+      strokeColor = '#ef4444'; // red for type mismatch
+      edgeLabel   = `${returnType} ❌`;
+    } else if (isDeletedSource) {
+      strokeColor = '#6b7280'; // gray/dim for deleted source
+      edgeLabel   = `${returnType} 🗑️`;
+    }
 
     return {
-      id: `e${sourceId}-${targetId}-${index}`,
-      source: sourceId,
-      target: targetId,
-      label: isMismatch ? `${returnType} ❌` : returnType,
-      animated: isMismatch,
+      id:       `e${sourceId}-${targetId}-${index}`,
+      source:   sourceId,
+      target:   targetId,
+      label:    edgeLabel,
+      animated: isMismatch || isBroken,
       style: {
-        stroke: isMismatch ? '#ef4444' : '#94a3b8',
-        strokeWidth: isMismatch ? 3 : 2,
+        stroke:      strokeColor,
+        strokeWidth: (isMismatch || isBroken) ? 3 : 2,
+        strokeDasharray: isDeletedSource ? '5 5' : undefined,
       },
       markerEnd: {
-        type: 'arrowclosed',
-        color: isMismatch ? '#ef4444' : '#94a3b8',
+        type:  'arrowclosed',
+        color: strokeColor,
       },
       data: {
         returnType,
-        mismatch: isMismatch,
-        message: flow.message,
-        flowType: flow.type,
-        file: flow.file,
+        mismatch:          isMismatch,
+        brokenDependency:  isBroken,
+        deletedSource:     isDeletedSource,
+        message:           flow.message,
+        flowType:          flow.type,
+        file:              flow.file,
       },
     };
   });
+
+  const brokenDeps = edges.filter(e => e.data.brokenDependency).length;
 
   return {
     nodes,
     edges,
     stats: {
-      totalNodes: nodes.length,
-      totalEdges: edges.length,
-      mismatches: edges.filter(e => e.data.mismatch).length,
-      staticCalls: edges.filter(e => e.data.flowType === 'static_call').length,
+      totalNodes:       nodes.length,
+      totalEdges:       edges.length,
+      mismatches:       edges.filter(e => e.data.mismatch).length,
+      staticCalls:      edges.filter(e => e.data.flowType === 'static_call').length,
+      brokenDependencies: brokenDeps,
+      deletedClasses:   deletedClasses.length,
     },
   };
 }
