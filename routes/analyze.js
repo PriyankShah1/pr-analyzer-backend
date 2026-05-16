@@ -8,6 +8,9 @@ const { fetchPRDetails }   = require('../services/githubService');
 const { filterPHPFiles, buildEmptyResult, analyzeFiles } = require('../services/analysisService');
 const { handleGitHubError } = require('./errorHandler');
 
+
+
+
 router.post('/', rateLimit, async (req, res) => {
   const { url, token } = req.body;
 
@@ -35,16 +38,11 @@ router.post('/', rateLimit, async (req, res) => {
     console.log(`[analyze] PR #${prNumber} (${prState})`);
 
     const prMeta = { prTitle, prNumber, prAuthor, prState, prMerged };
-    const phpFiles = filterPHPFiles(files);
-
-    if (phpFiles.length === 0) {
-      return res.json(buildEmptyResult(prMeta));
-    }
-
+    // analyzeFiles auto-detects PHP vs JS/TS
+// it returns empty result if neither found
     let result;
     try {
-      result = analyzeFiles(phpFiles, prMeta);
-    } catch (error) {
+      result = analyzeFiles(files, prMeta);    } catch (error) {
       // guardLargePR throws here
       return res.status(422).json({ error: error.message });
     }
