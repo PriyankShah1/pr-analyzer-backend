@@ -2,7 +2,8 @@
 // Parses JS/TS files (Express.js) to detect code flow
 // Handles: .js, .ts, .jsx, .tsx files
 // Detects: Express routes, class services, TypeScript types,
-//          Prisma + Mongoose + TypeORM ORM calls, middleware chains
+//          Prisma + Mongoose + TypeORM ORM calls, middleware chains,
+//          functional controllers (no class), router.route() chained style
 
 // ── Supported file extensions ─────────────────────────────────────────────
 const JS_EXTENSIONS = ['.js', '.ts', '.jsx', '.tsx'];
@@ -11,7 +12,15 @@ function isJsFile(filename) {
   return JS_EXTENSIONS.some(ext => filename.endsWith(ext));
 }
 
-// ── Line extractors (same pattern as phpParser) ───────────────────────────
+// ── Words to skip for funcServiceCallRegex ────────────────────────────────
+// Common non-service awaited calls we don't want to track as flows
+const SKIP_AWAIT_WORDS = new Set([
+  'res', 'next', 'req', 'Promise', 'setTimeout', 'setInterval',
+  'fs', 'path', 'console', 'JSON', 'Math', 'Object', 'Array',
+  'Buffer', 'process', 'stream', 'pipe', 'done', 'cb', 'callback',
+]);
+
+// ── Line extractors ───────────────────────────────────────────────────────
 function extractAddedLines(patch) {
   if (!patch) return [];
   return patch
@@ -31,83 +40,54 @@ function extractDeletedLines(patch) {
 // ── Regex patterns ────────────────────────────────────────────────────────
 
 // Class detection
-// Matches: class UserController / class UserService extends BaseService
 const classRegex = /^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/;
 
-// Function/method detection
-// Matches: async store(req, res) / store = async (req, res) => / store(req, res, next)
-const methodRegex = /(?:async\s+)?(\w+)\s*[=:]\s*(?:async\s+)?\(|(?:async\s+)?(\w+)\s*\(/;
+// router.route() chained style
+// Matches: router.route('/upload').post(auth(), uploadController.uploadFile)
+const routerRouteRegex = /(?:router|app)\.route\s*\(\s*['"`]([^'"`]+)['"`]\s*\)\s*\.(get|post|put|patch|delete)/;
 
-// TypeScript method with explicit return type
+// Functional controller — const/arrow function
+// Matches: const uploadFile = catchAsync(async (req, res) => {
+const funcControllerRegex = /(?:const|let)\s+(\w+)\s*=\s*(?:catchAsync\s*\()?\s*async\s*\(/;
+
+// TypeScript method with return type
 // Matches: async createUser(dto: CreateUserDto): Promise<UserDto>
 const tsMethodRegex = /(?:async\s+)?(\w+)\s*\([^)]*\)\s*:\s*(Promise<[^>]+>|[\w<>[\]|]+)/;
 
-// this.service.method() calls
-// Matches: this.userService.createUser(data) / this.service.process()
+// this.service.method() calls (class style)
 const serviceCallRegex = /this\.(\w+)\.(\w+)\s*\(/;
 
-// Express route detection
-// Matches: router.get('/path', handler) / app.post('/path', [mid], handler)
-// Also: Router().get / this.router.post
-const expressRouteRegex = /(?:router|app|this\.router|Router\(\))\.(?:get|post|put|patch|delete|all)\s*\(\s*['"`]([^'"`]+)['"`]/;
-
-// Express route with method extraction
+// Express route with method + path + handlers
+// Matches: router.get('/users', auth, controller.store)
 const expressRouteFullRegex = /(?:router|app|this\.router|Router\(\))\.(get|post|put|patch|delete|all)\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*(.+)/;
 
 // router.use() middleware
-// Matches: router.use(authMiddleware) / router.use('/path', middleware)
 const routerUseRegex = /(?:router|app)\.use\s*\(\s*(?:['"`][^'"`]+['"`]\s*,\s*)?(\w+)/;
 
-// TypeScript return type
-// Matches: ): Promise<UserDto> / ): UserResponseDto / ): ApiResponse<User>
-const tsReturnTypeRegex = /\)\s*:\s*(Promise<([^>]+)>|([\w<>[\]|]+))\s*(?:\{|=>|$)/;
-
-// Constructor injection (TypeScript DI)
-// Matches: constructor(private userService: UserService, private mailService: MailService)
+// Constructor DI injection (TypeScript)
 const constructorParamRegex = /(?:private|protected|public|readonly)\s+(\w+)\s*:\s*(\w+)/g;
 
+// Functional service call (no "this.")
+// Matches: await uploadService.uploadFile() — but NOT await res.send()
+const funcServiceCallRegex = /\bawait\s+(\w+Service|\w+Repository|\w+Repo|\w+Manager|\w+Client|\w+Provider)\.(\w+)\s*\(/;
+
 // ── ORM: Prisma ───────────────────────────────────────────────────────────
-// Matches: prisma.user.create() / prisma.order.findUnique() / prisma.post.update()
 const prismaRegex = /prisma\.(\w+)\.(create|findUnique|findFirst|findMany|update|updateMany|upsert|delete|deleteMany|count|aggregate)\s*\(/;
 
 // ── ORM: Mongoose ─────────────────────────────────────────────────────────
-// Matches: User.findById(id) / Order.find({}) / Post.findOne({}) / User.save()
 const mongooseStaticRegex = /\b([A-Z]\w+)\.(findById|findOne|find|create|updateOne|updateMany|deleteOne|deleteMany|findByIdAndUpdate|findByIdAndDelete|countDocuments|aggregate)\s*\(/;
 
-// Matches: user.save() / doc.remove() (instance methods)
-const mongooseInstanceRegex = /\b(\w+)\.(save|remove|populate|lean)\s*\(/;
-
 // ── ORM: TypeORM ──────────────────────────────────────────────────────────
-// Matches: userRepository.save(entity) / this.userRepo.findOne({where})
 const typeormRegex = /(?:this\.)?(\w*[Rr]epository|\w*[Rr]epo)\.(?:save|find|findOne|findOneBy|findBy|update|delete|remove|insert|count|exists|createQueryBuilder)\s*\(/;
 
 // Import tracking
-// Matches: import { UserService } from './services/UserService'
 const importRegex = /import\s+(?:type\s+)?(?:\{[^}]+\}|\w+)\s+from\s+['"`]([^'"`]+)['"`]/;
-
-// require() tracking
-// Matches: const userService = require('./services/userService')
 const requireRegex = /(?:const|let|var)\s+(?:\{[^}]+\}|\w+)\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/;
 
-// ── Classify JS/TS class by name ──────────────────────────────────────────
-function classifyJsClass(className) {
-  if (className.endsWith('Controller'))  return 'controller';
-  if (className.endsWith('Service'))     return 'service';
-  if (className.endsWith('Repository') || className.endsWith('Repo')) return 'repository';
-  if (className.endsWith('Middleware'))  return 'middleware';
-  if (className.endsWith('Guard'))       return 'middleware';   // NestJS guards
-  if (className.endsWith('Resolver'))    return 'controller';   // GraphQL resolvers
-  if (className.endsWith('Handler'))     return 'service';
-  if (className.endsWith('Model'))       return 'model';
-  if (className.endsWith('Schema'))      return 'model';
-  return 'service';
-}
-
-// ── Extract middleware names from Express route handler list ──────────────
-// e.g. "[authMiddleware, validateBody], controller.store"
-// → ['authMiddleware', 'validateBody']
+// ── Extract middleware from route handler string ───────────────────────────
 function extractMiddlewareFromRoute(handlerStr) {
   const middlewares = [];
+
   // Array-style: [auth, validate]
   const arrayMatch = handlerStr.match(/\[([^\]]+)\]/);
   if (arrayMatch) {
@@ -116,16 +96,17 @@ function extractMiddlewareFromRoute(handlerStr) {
       if (name && !name.includes('.')) middlewares.push(name);
     });
   }
-  // Individual args before last handler (last is usually the controller method)
+
+  // Individual args before last handler
   const args = handlerStr.split(',').map(s => s.trim());
   if (args.length > 1) {
-    // All but last are potential middleware
     args.slice(0, -1).forEach(arg => {
       const name = arg.replace(/^\[|\]$/g, '').trim();
       if (name && /^\w+$/.test(name)) middlewares.push(name);
     });
   }
-  return [...new Set(middlewares)]; // deduplicate
+
+  return [...new Set(middlewares)];
 }
 
 // ── Track deleted JS/TS entities ──────────────────────────────────────────
@@ -152,10 +133,7 @@ function parseDeletedJsEntities(files) {
     });
   });
 
-  return {
-    deletedClasses,
-    deletedFunctions,
-  };
+  return { deletedClasses, deletedFunctions };
 }
 
 // ── Main parser ───────────────────────────────────────────────────────────
@@ -165,25 +143,23 @@ function parseJsFlow(files) {
   files.forEach(file => {
     if (!isJsFile(file.filename)) return;
 
-    const lines          = extractAddedLines(file.patch);
-    let currentClass     = null;
-    let currentMethod    = null;
+    const lines           = extractAddedLines(file.patch);
+    let currentClass      = null;
+    let currentMethod     = null;
     let currentReturnType = null;
-    const imports        = new Map(); // localName → modulePath
+    const imports         = new Map();
 
     lines.forEach(line => {
 
       // ── Import tracking ────────────────────────────────────────────────
       const importMatch = line.match(importRegex);
       if (importMatch) {
-        // Extract named imports: import { UserService, MailService } from '...'
         const namedMatch = line.match(/import\s+\{([^}]+)\}/);
         if (namedMatch) {
           namedMatch[1].split(',').forEach(name => {
             imports.set(name.trim(), importMatch[1]);
           });
         }
-        // Default import: import UserService from '...'
         const defaultMatch = line.match(/import\s+(\w+)\s+from/);
         if (defaultMatch) imports.set(defaultMatch[1], importMatch[1]);
       }
@@ -197,73 +173,103 @@ function parseJsFlow(files) {
       // ── Class detection ────────────────────────────────────────────────
       const classMatch = line.match(classRegex);
       if (classMatch) {
-        currentClass  = classMatch[1];
-        currentMethod = null;
+        currentClass      = classMatch[1];
+        currentMethod     = null;
         currentReturnType = null;
         return;
       }
 
-      // ── Constructor injection (TypeScript DI) ──────────────────────────
+      // ── Constructor DI injection ───────────────────────────────────────
       if (line.includes('constructor(') && currentClass) {
-        let match;
         constructorParamRegex.lastIndex = 0;
+        let match;
         while ((match = constructorParamRegex.exec(line)) !== null) {
-          // Record injected dependency: e.g. userService: UserService
-          // This helps us understand what this.userService refers to
-          imports.set(match[1], match[2]); // localPropName → TypeName
+          imports.set(match[1], match[2]);
         }
       }
 
-      // ── Method/function detection ──────────────────────────────────────
+      // ── router.route() chained style ──────────────────────────────────
+      // e.g. router.route('/upload').post(auth(), uploadController.uploadFile)
+      const routerRouteMatch = line.match(routerRouteRegex);
+      if (routerRouteMatch) {
+        const path   = routerRouteMatch[1];
+        const method = routerRouteMatch[2].toUpperCase();
+
+        // Extract last controller.method from the line
+        const controllerMatches = [...line.matchAll(/(\w+)\.(\w+)\s*[,)]/g)];
+        const lastHandler = controllerMatches.length > 0
+          ? controllerMatches[controllerMatches.length - 1]
+          : null;
+
+        const toNode = lastHandler
+          ? `${lastHandler[1]}@${lastHandler[2]}`
+          : `handler@${method.toLowerCase()}`;
+
+        flows.push({
+          from: `Route:${method} ${path}`,
+          to:   toNode,
+          type: 'route',
+          returnType: 'request',
+          file: file.filename,
+        });
+      }
+
+      // ── Functional controller detection ────────────────────────────────
+      // e.g. const uploadFile = catchAsync(async (req, res) => {
+      const funcMatch = line.match(funcControllerRegex);
+      if (funcMatch) {
+        currentMethod     = funcMatch[1];
+        currentReturnType = null;
+      }
+
+      // ── Method detection (class-based) ─────────────────────────────────
       const tsMethodMatch = line.match(tsMethodRegex);
       if (tsMethodMatch && currentClass) {
         currentMethod     = tsMethodMatch[1];
         currentReturnType = tsMethodMatch[2] || null;
-      } else {
-        // Fallback for plain JS methods
+      } else if (currentClass) {
         const plainMethodMatch = line.match(/(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/);
-        if (plainMethodMatch && currentClass && !['if', 'for', 'while', 'switch', 'catch', 'function'].includes(plainMethodMatch[1])) {
+        if (
+          plainMethodMatch &&
+          !['if','for','while','switch','catch','function','constructor'].includes(plainMethodMatch[1])
+        ) {
           currentMethod     = plainMethodMatch[1];
           currentReturnType = null;
         }
       }
 
-      // ── Express route detection ────────────────────────────────────────
+      // ── Express route detection (router.get/post/etc.) ─────────────────
       const routeFullMatch = line.match(expressRouteFullRegex);
       if (routeFullMatch) {
-        const method      = routeFullMatch[1].toUpperCase();
-        const path        = routeFullMatch[2];
-        const handlerStr  = routeFullMatch[3] || '';
-// Extract the actual handler from the route string
-// e.g. "authMiddleware, UserController.store" → "UserController@store"
-const handlerArgs = handlerStr.split(',').map(s => s.trim());
-const lastArg = handlerArgs[handlerArgs.length - 1];
+        const method     = routeFullMatch[1].toUpperCase();
+        const path       = routeFullMatch[2];
+        const handlerStr = routeFullMatch[3] || '';
 
-// Detect "Controller.method" or "controller.method" pattern
-const handlerMatch = lastArg.match(/(\w+)\.(\w+)/);
-const toNode = handlerMatch
-  ? `${handlerMatch[1]}@${handlerMatch[2]}`
-  : currentClass
-    ? `${currentClass}@handler`
-    : `handler@${method.toLowerCase()}`;
+        const handlerArgs = handlerStr.split(',').map(s => s.trim());
+        const lastArg     = handlerArgs[handlerArgs.length - 1];
+        const handlerMatch = lastArg.match(/(\w+)\.(\w+)/);
 
-flows.push({
-  from:       `Route:${method} ${path}`,
-  to:         toNode,
-  type:       'route',
-  returnType: 'request',
-  file:       file.filename,
-});
+        const toNode = handlerMatch
+          ? `${handlerMatch[1]}@${handlerMatch[2]}`
+          : currentClass
+            ? `${currentClass}@handler`
+            : `handler@${method.toLowerCase()}`;
 
-        // Extract middleware from route
-        const middlewares = extractMiddlewareFromRoute(handlerStr);
-        middlewares.forEach(mw => {
+        flows.push({
+          from: `Route:${method} ${path}`,
+          to:   toNode,
+          type: 'route',
+          returnType: 'request',
+          file: file.filename,
+        });
+
+        extractMiddlewareFromRoute(handlerStr).forEach(mw => {
           flows.push({
-            from:       `Middleware:${mw}`,
-            to:         `Route:${method} ${path}`,
-            type:       'middleware',
+            from: `Middleware:${mw}`,
+            to:   `Route:${method} ${path}`,
+            type: 'middleware',
             returnType: 'request',
-            file:       file.filename,
+            file: file.filename,
           });
         });
         return;
@@ -273,31 +279,48 @@ flows.push({
       const routerUseMatch = line.match(routerUseRegex);
       if (routerUseMatch && currentClass) {
         flows.push({
-          from:       `Middleware:${routerUseMatch[1]}`,
-          to:         `${currentClass}@router`,
-          type:       'middleware',
+          from: `Middleware:${routerUseMatch[1]}`,
+          to:   `${currentClass}@router`,
+          type: 'middleware',
           returnType: 'request',
-          file:       file.filename,
+          file: file.filename,
         });
       }
 
-      // ── Only track calls inside a class method ─────────────────────────
-      if (!currentClass || !currentMethod) return;
-      const fromLabel = `${currentClass}@${currentMethod}`;
+      // ── Skip if no current method context ─────────────────────────────
+      if (!currentMethod) return;
+
+      const fromLabel = currentClass
+        ? `${currentClass}@${currentMethod}`
+        : currentMethod;
 
       // ── this.service.method() calls ────────────────────────────────────
       const serviceMatch = line.match(serviceCallRegex);
       if (serviceMatch) {
         const [, propName, method] = serviceMatch;
-        // Try to resolve the real class name from constructor injection
         const resolvedClass = imports.get(propName) || propName;
         flows.push({
-          from:       fromLabel,
-          to:         `${resolvedClass}@${method}`,
-          type:       'call',
+          from: fromLabel,
+          to:   `${resolvedClass}@${method}`,
+          type: 'call',
           returnType: currentReturnType || 'unknown',
-          file:       file.filename,
+          file: file.filename,
         });
+      }
+
+      // ── Functional service call (await service.method()) ───────────────
+      const funcServiceMatch = line.match(funcServiceCallRegex);
+      if (funcServiceMatch) {
+        const [, serviceName, method] = funcServiceMatch;
+        if (!SKIP_AWAIT_WORDS.has(serviceName)) {
+          flows.push({
+            from: fromLabel,
+            to:   `${serviceName}@${method}`,
+            type: 'call',
+            returnType: 'unknown',
+            file: file.filename,
+          });
+        }
       }
 
       // ── Prisma ORM calls ───────────────────────────────────────────────
@@ -305,11 +328,11 @@ flows.push({
       if (prismaMatch) {
         const [, model, operation] = prismaMatch;
         flows.push({
-          from:       fromLabel,
-          to:         `prisma.${model}.${operation}`,
-          type:       'orm_call',
+          from: fromLabel,
+          to:   `prisma.${model}.${operation}`,
+          type: 'orm_call',
           returnType: 'object',
-          file:       file.filename,
+          file: file.filename,
         });
       }
 
@@ -317,14 +340,13 @@ flows.push({
       const mongooseMatch = line.match(mongooseStaticRegex);
       if (mongooseMatch) {
         const [, model, operation] = mongooseMatch;
-        // Skip if it looks like a Prisma model (lowercase first letter)
         if (model[0] === model[0].toUpperCase()) {
           flows.push({
-            from:       fromLabel,
-            to:         `${model}.${operation}`,
-            type:       'orm_call',
+            from: fromLabel,
+            to:   `${model}.${operation}`,
+            type: 'orm_call',
             returnType: 'object',
-            file:       file.filename,
+            file: file.filename,
           });
         }
       }
@@ -333,24 +355,25 @@ flows.push({
       const typeormMatch = line.match(typeormRegex);
       if (typeormMatch) {
         const [, repoName] = typeormMatch;
-        const operation    = line.match(/\.(save|find|findOne|findOneBy|findBy|update|delete|remove|insert|count)\s*\(/)?.[1] || 'query';
+        const operation = line.match(
+          /\.(save|find|findOne|findOneBy|findBy|update|delete|remove|insert|count)\s*\(/
+        )?.[1] || 'query';
         flows.push({
-          from:       fromLabel,
-          to:         `${repoName}.${operation}`,
-          type:       'orm_call',
+          from: fromLabel,
+          to:   `${repoName}.${operation}`,
+          type: 'orm_call',
           returnType: 'object',
-          file:       file.filename,
+          file: file.filename,
         });
       }
     });
   });
 
-  // Also track deleted JS entities
   const { deletedClasses, deletedFunctions } = parseDeletedJsEntities(files);
 
   return {
     flows,
-    deletedClasses:   Array.from(deletedClasses),
+    deletedClasses: Array.from(deletedClasses),
     deletedFunctions: Object.fromEntries(
       Array.from(deletedFunctions.entries()).map(([k, v]) => [k, Array.from(v)])
     ),
