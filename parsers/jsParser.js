@@ -1,7 +1,7 @@
 // parsers/jsParser.js
-// Parses JS/TS files (Express.js) to detect code flow
+// Parses JS/TS files (Express.js + NestJS) to detect code flow
 // Handles: .js, .ts, .jsx, .tsx files
-// Detects: Express routes, class services, TypeScript types,
+// Detects: Express routes, NestJS decorators, class services, TypeScript types,
 //          Prisma + Mongoose + TypeORM ORM calls, middleware chains,
 //          functional controllers (no class), router.route() chained style
 
@@ -13,7 +13,6 @@ function isJsFile(filename) {
 }
 
 // ── Words to skip for funcServiceCallRegex ────────────────────────────────
-// Common non-service awaited calls we don't want to track as flows
 const SKIP_AWAIT_WORDS = new Set([
   'res', 'next', 'req', 'Promise', 'setTimeout', 'setInterval',
   'fs', 'path', 'console', 'JSON', 'Math', 'Object', 'Array',
@@ -42,23 +41,34 @@ function extractDeletedLines(patch) {
 // Class detection
 const classRegex = /^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/;
 
+// ── NestJS: @Controller('path') ────────────────────────────────────────────
+const nestControllerRegex = /@Controller\s*\(\s*['"`]?([^'")\s]*)['"`]?\s*\)?/;
+
+// ── NestJS: @Get()/@Post()/@Put()/@Patch()/@Delete() on a method ───────────
+const nestRouteDecoratorRegex = /@(Get|Post|Put|Patch|Delete|All)\s*\(\s*['"`]?([^'")\s]*)['"`]?\s*\)?/;
+
+// ── NestJS: @Injectable() ───────────────────────────────────────────────────
+const nestInjectableRegex = /@Injectable\s*\(\s*\)?/;
+
+// ── NestJS: @UseGuards(AuthGuard) / @UseInterceptors(...) ──────────────────
+const nestGuardRegex = /@Use(?:Guards|Interceptors|Pipes)\s*\(\s*([^)]+)\)/;
+
+// ── NestJS: method name following a route decorator ────────────────────────
+const nestMethodNameRegex = /(?:async\s+)?(\w+)\s*\(/;
+
 // router.route() chained style
-// Matches: router.route('/upload').post(auth(), uploadController.uploadFile)
 const routerRouteRegex = /(?:router|app)\.route\s*\(\s*['"`]([^'"`]+)['"`]\s*\)\s*\.(get|post|put|patch|delete)/;
 
 // Functional controller — const/arrow function
-// Matches: const uploadFile = catchAsync(async (req, res) => {
 const funcControllerRegex = /(?:const|let)\s+(\w+)\s*=\s*(?:catchAsync\s*\()?\s*async\s*\(/;
 
 // TypeScript method with return type
-// Matches: async createUser(dto: CreateUserDto): Promise<UserDto>
 const tsMethodRegex = /(?:async\s+)?(\w+)\s*\([^)]*\)\s*:\s*(Promise<[^>]+>|[\w<>[\]|]+)/;
 
 // this.service.method() calls (class style)
 const serviceCallRegex = /this\.(\w+)\.(\w+)\s*\(/;
 
 // Express route with method + path + handlers
-// Matches: router.get('/users', auth, controller.store)
 const expressRouteFullRegex = /(?:router|app|this\.router|Router\(\))\.(get|post|put|patch|delete|all)\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*(.+)/;
 
 // router.use() middleware
@@ -68,7 +78,6 @@ const routerUseRegex = /(?:router|app)\.use\s*\(\s*(?:['"`][^'"`]+['"`]\s*,\s*)?
 const constructorParamRegex = /(?:private|protected|public|readonly)\s+(\w+)\s*:\s*(\w+)/g;
 
 // Functional service call (no "this.")
-// Matches: await uploadService.uploadFile() — but NOT await res.send()
 const funcServiceCallRegex = /\bawait\s+(\w+Service|\w+Repository|\w+Repo|\w+Manager|\w+Client|\w+Provider)\.(\w+)\s*\(/;
 
 // ── ORM: Prisma ───────────────────────────────────────────────────────────
@@ -84,11 +93,10 @@ const typeormRegex = /(?:this\.)?(\w*[Rr]epository|\w*[Rr]epo)\.(?:save|find|fin
 const importRegex = /import\s+(?:type\s+)?(?:\{[^}]+\}|\w+)\s+from\s+['"`]([^'"`]+)['"`]/;
 const requireRegex = /(?:const|let|var)\s+(?:\{[^}]+\}|\w+)\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/;
 
-// ── Extract middleware from route handler string ───────────────────────────
+// ── Extract middleware from Express route handler string ──────────────────
 function extractMiddlewareFromRoute(handlerStr) {
   const middlewares = [];
 
-  // Array-style: [auth, validate]
   const arrayMatch = handlerStr.match(/\[([^\]]+)\]/);
   if (arrayMatch) {
     arrayMatch[1].split(',').forEach(m => {
@@ -97,7 +105,6 @@ function extractMiddlewareFromRoute(handlerStr) {
     });
   }
 
-  // Individual args before last handler
   const args = handlerStr.split(',').map(s => s.trim());
   if (args.length > 1) {
     args.slice(0, -1).forEach(arg => {
@@ -107,6 +114,14 @@ function extractMiddlewareFromRoute(handlerStr) {
   }
 
   return [...new Set(middlewares)];
+}
+
+// ── Build a clean NestJS path: combine controller base + method path ──────
+function buildNestPath(basePath, methodPath) {
+  const base   = (basePath || '').replace(/^\/|\/$/g, '');
+  const method = (methodPath || '').replace(/^\/|\/$/g, '');
+  const full   = [base, method].filter(Boolean).join('/');
+  return '/' + full;
 }
 
 // ── Track deleted JS/TS entities ──────────────────────────────────────────
@@ -143,11 +158,13 @@ function parseJsFlow(files) {
   files.forEach(file => {
     if (!isJsFile(file.filename)) return;
 
-    const lines           = extractAddedLines(file.patch);
-    let currentClass      = null;
-    let currentMethod     = null;
-    let currentReturnType = null;
-    const imports         = new Map();
+    const lines             = extractAddedLines(file.patch);
+    let currentClass        = null;
+    let currentMethod       = null;
+    let currentReturnType   = null;
+    let nestControllerBase  = null;
+    let pendingNestMethod   = null;
+    const imports           = new Map();
 
     lines.forEach(line => {
 
@@ -170,6 +187,46 @@ function parseJsFlow(files) {
         if (nameMatch) imports.set(nameMatch[1], requireMatch[1]);
       }
 
+      // ── NestJS: @Controller('path') — appears before class line ────────
+      const nestControllerMatch = line.match(nestControllerRegex);
+      if (nestControllerMatch) {
+        nestControllerBase = nestControllerMatch[1] || '';
+        return;
+      }
+
+      // ── NestJS: @Injectable() — no-op marker, class style already covers it
+      if (nestInjectableRegex.test(line)) {
+        return;
+      }
+
+      // ── NestJS: @UseGuards(AuthGuard) / @UseInterceptors(...) ──────────
+      const nestGuardMatch = line.match(nestGuardRegex);
+      if (nestGuardMatch) {
+        const guardNames = nestGuardMatch[1].split(',').map(g => g.trim().replace(/\(.*\)/, ''));
+        guardNames.forEach(guard => {
+          if (guard) {
+            flows.push({
+              from: `Middleware:${guard}`,
+              to:   currentClass ? `${currentClass}@guard` : `Guard:${guard}`,
+              type: 'middleware',
+              returnType: 'request',
+              file: file.filename,
+            });
+          }
+        });
+        return;
+      }
+
+      // ── NestJS: @Get()/@Post()/etc. — remember until method name appears ─
+      const nestRouteMatch = line.match(nestRouteDecoratorRegex);
+      if (nestRouteMatch) {
+        pendingNestMethod = {
+          httpMethod: nestRouteMatch[1].toUpperCase(),
+          path:       nestRouteMatch[2] || '',
+        };
+        return;
+      }
+
       // ── Class detection ────────────────────────────────────────────────
       const classMatch = line.match(classRegex);
       if (classMatch) {
@@ -188,19 +245,33 @@ function parseJsFlow(files) {
         }
       }
 
-      // ── router.route() chained style ──────────────────────────────────
-      // e.g. router.route('/upload').post(auth(), uploadController.uploadFile)
+      // ── Resolve pending NestJS route decorator to a method name ────────
+      if (pendingNestMethod && currentClass) {
+        const methodNameMatch = line.match(nestMethodNameRegex);
+        if (methodNameMatch && !['constructor', 'if', 'for', 'while'].includes(methodNameMatch[1])) {
+          const fullPath = buildNestPath(nestControllerBase, pendingNestMethod.path);
+          flows.push({
+            from: `Route:${pendingNestMethod.httpMethod} ${fullPath}`,
+            to:   `${currentClass}@${methodNameMatch[1]}`,
+            type: 'route',
+            returnType: 'request',
+            file: file.filename,
+          });
+          currentMethod     = methodNameMatch[1];
+          currentReturnType = null;
+          pendingNestMethod = null;
+        }
+      }
+
+      // ── router.route() chained style (Express) ──────────────────────────
       const routerRouteMatch = line.match(routerRouteRegex);
       if (routerRouteMatch) {
         const path   = routerRouteMatch[1];
         const method = routerRouteMatch[2].toUpperCase();
-
-        // Extract last controller.method from the line
         const controllerMatches = [...line.matchAll(/(\w+)\.(\w+)\s*[,)]/g)];
         const lastHandler = controllerMatches.length > 0
           ? controllerMatches[controllerMatches.length - 1]
           : null;
-
         const toNode = lastHandler
           ? `${lastHandler[1]}@${lastHandler[2]}`
           : `handler@${method.toLowerCase()}`;
@@ -214,20 +285,19 @@ function parseJsFlow(files) {
         });
       }
 
-      // ── Functional controller detection ────────────────────────────────
-      // e.g. const uploadFile = catchAsync(async (req, res) => {
+      // ── Functional controller (Express) ─────────────────────────────────
       const funcMatch = line.match(funcControllerRegex);
       if (funcMatch) {
         currentMethod     = funcMatch[1];
         currentReturnType = null;
       }
 
-      // ── Method detection (class-based) ─────────────────────────────────
+      // ── Method detection (class-based, non-Nest) ────────────────────────
       const tsMethodMatch = line.match(tsMethodRegex);
-      if (tsMethodMatch && currentClass) {
+      if (tsMethodMatch && currentClass && !pendingNestMethod) {
         currentMethod     = tsMethodMatch[1];
         currentReturnType = tsMethodMatch[2] || null;
-      } else if (currentClass) {
+      } else if (currentClass && !pendingNestMethod) {
         const plainMethodMatch = line.match(/(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/);
         if (
           plainMethodMatch &&
@@ -245,9 +315,9 @@ function parseJsFlow(files) {
         const path       = routeFullMatch[2];
         const handlerStr = routeFullMatch[3] || '';
 
-        const handlerArgs = handlerStr.split(',').map(s => s.trim());
-        const lastArg     = handlerArgs[handlerArgs.length - 1];
-        const handlerMatch = lastArg.match(/(\w+)\.(\w+)/);
+        const handlerArgs  = handlerStr.split(',').map(s => s.trim());
+        const lastArg       = handlerArgs[handlerArgs.length - 1];
+        const handlerMatch  = lastArg.match(/(\w+)\.(\w+)/);
 
         const toNode = handlerMatch
           ? `${handlerMatch[1]}@${handlerMatch[2]}`
@@ -275,7 +345,7 @@ function parseJsFlow(files) {
         return;
       }
 
-      // ── router.use() middleware ────────────────────────────────────────
+      // ── router.use() middleware (Express) ───────────────────────────────
       const routerUseMatch = line.match(routerUseRegex);
       if (routerUseMatch && currentClass) {
         flows.push({
