@@ -7,8 +7,11 @@ const { enrichWithTypes, detectMismatches, detectBrokenDependencies } = require(
 const { buildVisualizationResponse }          = require('../visualizer');
 const { guardLargePR, guardLargeJsPR, truncateLargeFiles, truncateLargeJsFiles, MAX_FILE_LINES } = require('../utils/validation');
 
-const MAX_CODE_CONTEXT_FILES = 5;   // cap how many files go into the AI prompt
-const MAX_LINES_PER_FILE     = 25;  // cap lines per file in the AI context
+// How many files go into the AI prompt — ranked by relevance, not array order.
+// No per-file line cap here. The character ceiling in aiService.js (6000 chars)
+// is the real guard — it measures actual prompt size, not an arbitrary line count.
+// A 120-line controller is fully included; aiService trims if total exceeds the budget.
+const MAX_CODE_CONTEXT_FILES = 5;
 
 // ── File filters ──────────────────────────────────────────────────────────
 function filterPHPFiles(files) {
@@ -33,12 +36,13 @@ function isLowSignalFile(filename) {
   return LOW_SIGNAL_PATTERNS.some(pattern => pattern.test(filename));
 }
 
-// ── Build a compact real-code snippet block for AI explanation ────────────
-// Ranks files by RELEVANCE (how often they appear in the detected flows),
-// not by array order. Files driving the actual code flow — the controller
-// or service that shows up repeatedly in flow.file — get priority over
-// test files, configs, or files that produced zero flows.
+// ── Build code context for AI explanation ─────────────────────────────────
+// Ranks files by how many flows reference them (most relevant first),
+// filters out low-signal files (tests, configs, lockfiles),
+// and sends ALL added lines from each file — no per-file line cap.
+// aiService.js's 6000-char ceiling is the only guard on total prompt size.
 function buildCodeContext(files, flows, lineExtractor) {
+  // Count how often each file appears in the detected flows
   const fileRelevance = new Map();
   flows.forEach(flow => {
     if (flow.file) {
@@ -46,23 +50,27 @@ function buildCodeContext(files, flows, lineExtractor) {
     }
   });
 
+  // Sort by relevance score — files driving the most flows come first
   const rankedFiles = [...files]
     .filter(f => !isLowSignalFile(f.filename))
     .sort((a, b) => {
       const relevanceA = fileRelevance.get(a.filename) || 0;
       const relevanceB = fileRelevance.get(b.filename) || 0;
-      return relevanceB - relevanceA; // most flow-referenced files first
+      return relevanceB - relevanceA;
     });
 
-  // Fallback: if every file got filtered out (e.g. PR is only test changes),
-  // use the original list so we still produce SOME context.
+  // Fallback: if all files got filtered (e.g. PR is only test changes),
+  // use original list so we still produce some context
   const candidateFiles = rankedFiles.length > 0 ? rankedFiles : files;
 
-  const snippets = candidateFiles.slice(0, MAX_CODE_CONTEXT_FILES).map(file => {
-    const lines = lineExtractor(file.patch).slice(0, MAX_LINES_PER_FILE);
-    if (lines.length === 0) return null;
-    return `// ${file.filename}\n${lines.join('\n')}`;
-  }).filter(Boolean);
+  const snippets = candidateFiles
+    .slice(0, MAX_CODE_CONTEXT_FILES)
+    .map(file => {
+      const lines = lineExtractor(file.patch); // full file — no line slice
+      if (lines.length === 0) return null;
+      return `// ${file.filename}\n${lines.join('\n')}`;
+    })
+    .filter(Boolean);
 
   return snippets.join('\n\n');
 }
