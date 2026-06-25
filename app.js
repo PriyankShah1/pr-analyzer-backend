@@ -18,6 +18,7 @@ app.use(securityHeaders);
 app.use('/health',  require('./routes/health'));
 app.use('/files',   require('./routes/files'));
 app.use('/analyze', require('./routes/analyze'));
+app.use('/explain', require('./routes/explain')); // ← NEW: AI explanation
 
 // ── 404 handler ───────────────────────────────────────────────────────────
 app.use((req, res) => {
