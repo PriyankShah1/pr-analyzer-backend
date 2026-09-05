@@ -183,7 +183,11 @@ router.post('/', rateLimit, async (req, res) => {
             fingerprint: r.fingerprint,
             title: r.title,
             path: r.path,
+            url: r.url,
           })),
+          // Already marked on an earlier run. Carried with their GitHub links
+          // so "3 already marked resolved" can be checked rather than trusted.
+          alreadyResolved: plan.skipped.alreadyResolved || [],
           skipped: plan.skipped,
           counts: plan.counts,
         },

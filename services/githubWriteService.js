@@ -238,6 +238,10 @@ async function fetchPostedFingerprints(octokit, repoInfo) {
       line: c.line ?? c.original_line ?? null,
       isReviewComment: Boolean(c.path),
       isResolvedNote: /^✅ \*\*Resolved/.test(c.body || ''),
+      // A direct link to the comment on GitHub. An inline review comment lives
+      // on the Files-changed tab, so "3 marked resolved" was unverifiable
+      // without hunting through the whole diff for it.
+      url: c.html_url || null,
     });
   }
 
@@ -290,9 +294,20 @@ function buildCommentPlan({
   // A fingerprint we previously commented on that is no longer reported has
   // been fixed. Mark the existing comment rather than leaving stale advice.
   const toMarkResolved = [];
+  const alreadyResolved = [];
   for (const [fp, comment] of postedFingerprints) {
     if (currentFingerprints.has(fp)) continue;
-    if (comment.isResolvedNote) continue;      // already marked
+    if (comment.isResolvedNote) {
+      // Marked on an earlier run. Reported so the UI can point at it, rather
+      // than only counting it.
+      alreadyResolved.push({
+        fingerprint: fp,
+        title: extractTitleFromBody(comment.body),
+        path: comment.path || null,
+        url: comment.url || null,
+      });
+      continue;
+    }
     if (!comment.isReviewComment) continue;    // summary comment, not a finding
     toMarkResolved.push({
       fingerprint: fp,
@@ -303,6 +318,7 @@ function buildCommentPlan({
       // edit to comments already on their PR.
       title: extractTitleFromBody(comment.body),
       path: comment.path || null,
+      url: comment.url || null,
     });
   }
 
@@ -353,6 +369,7 @@ function buildCommentPlan({
       alreadyPosted: alreadyPosted.map(f => ({ fingerprint: f.fingerprint, title: f.title })),
       unanchored: unanchored.map(f => ({ fingerprint: f.fingerprint, title: f.title, file: f.file })),
       deselected: deselected.map(f => ({ fingerprint: f.fingerprint, title: f.title })),
+      alreadyResolved,
       truncated,
     },
     counts: {
@@ -361,6 +378,7 @@ function buildCommentPlan({
       alreadyPosted: alreadyPosted.length,
       unanchored: unanchored.length,
       deselected: deselected.length,
+      alreadyResolved: alreadyResolved.length,
       truncated,
     },
   };
