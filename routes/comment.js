@@ -32,7 +32,7 @@ const { buildGraphFindings } = require('../services/graphFindings');
 const { handleGitHubError } = require('./errorHandler');
 const {
   createOctokit, fetchPostedState, buildCommentPlan,
-  executeCommentPlan, checkIdentity,
+  executeCommentPlan, checkIdentity, findSummaryComments,
 } = require('../services/githubWriteService');
 const { isDemoPR, getDemoPRDetails } = require('../fixtures/demoPR');
 const { createDemoOctokit, DEMO_CONFIRM_REFUSAL } = require('../fixtures/demoGithub');
@@ -223,7 +223,11 @@ router.post('/', rateLimit, async (req, res) => {
       });
     }
 
-    const outcome = await executeCommentPlan(octokit, repoInfo, plan, { prHeadSha });
+    // Located so the summary can be refreshed in place rather than duplicated.
+    const existingSummaries = demo ? [] : await findSummaryComments(octokit, repoInfo).catch(() => []);
+    const outcome = await executeCommentPlan(octokit, repoInfo, plan, {
+      prHeadSha, existingSummaries,
+    });
 
     // "Already on the PR" is a SUCCESS, not a failure. fetchPostedFingerprints
     // only returns a fingerprint it read back out of a real comment body on
@@ -276,7 +280,9 @@ router.post('/', rateLimit, async (req, res) => {
       message: outcome.postedInline === 0 && alreadyPosted.length > 0
         ? `Already on this PR — ${alreadyPosted.length} finding(s) were commented on previously, so nothing was duplicated.`
         : `Posted ${outcome.postedInline} inline comment(s)`
-        + `${outcome.postedSummary ? ' and a summary' : ''}`
+        + `${outcome.updatedSummaries > 0
+              ? ` and refreshed the summary`
+              : outcome.postedSummary ? ' and a summary' : ''}`
         + `${outcome.markedResolved ? `, marked ${outcome.markedResolved} resolved` : ''}.`
         + `${outcome.errors.length > 0 ? ` ${outcome.errors.length} failed — see errors.` : ''}`,
     });

@@ -75,6 +75,8 @@ function createDemoOctokit() {
       // idempotency check correctly sees a clean slate and plans every
       // finding as new. That is the honest state, not a convenience.
       listReviewComments: async () => ({ data: [] }),
+      listReviews: async () => ({ data: [] }),
+      updateReview: refuseWrite('pulls.updateReview'),
 
       createReviewComment: refuseWrite('pulls.createReviewComment'),
       createReview: refuseWrite('pulls.createReview'),
@@ -87,6 +89,11 @@ function createDemoOctokit() {
       updateComment: refuseWrite('issues.updateComment'),
     },
 
+    // fetchReviewThreads() probes GraphQL. The fixture has no threads, so the
+    // resolve path falls back exactly as it would on a host without it.
+    graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [] } } } }),
+
+    // Listing reviews is how a summary posted as a review body is found.
     users: {
       // checkIdentity() calls this. The demo has no real account behind it.
       getAuthenticated: async () => ({ data: { login: 'demo-user' } }),

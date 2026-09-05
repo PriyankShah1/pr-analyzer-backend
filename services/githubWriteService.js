@@ -199,14 +199,51 @@ async function fetchPostedState(octokit, repoInfo) {
   return { posted, hasSummary };
 }
 
+/**
+ * Every summary we have already put on this PR.
+ *
+ * A summary can live in TWO places and they are different API surfaces:
+ *
+ *   - the BODY of a review, when it was posted alongside inline comments
+ *     (pulls.createReview) — visible via pulls.listReviews
+ *   - a standalone issue comment, when there was nothing to post inline
+ *     (issues.createComment) — visible via issues.listComments
+ *
+ * Checking only the second is why the tool could not see its own summaries and
+ * kept adding more: the ones it had posted with inline comments were invisible
+ * to it.
+ */
+async function findSummaryComments(octokit, repoInfo) {
+  const found = [];
+
+  const [reviews, issueComments] = await Promise.all([
+    octokit.paginate(octokit.pulls.listReviews, {
+      owner: repoInfo.owner, repo: repoInfo.repo,
+      pull_number: repoInfo.pull_number, per_page: 100,
+    }).catch(() => []),
+    octokit.paginate(octokit.issues.listComments, {
+      owner: repoInfo.owner, repo: repoInfo.repo,
+      issue_number: repoInfo.pull_number, per_page: 100,
+    }).catch(() => []),
+  ]);
+
+  for (const r of reviews) {
+    if (String(r.body || '').includes(SUMMARY_HEADING)) {
+      found.push({ kind: 'review', id: r.id, url: r.html_url || null });
+    }
+  }
+  for (const c of issueComments) {
+    if (String(c.body || '').includes(SUMMARY_HEADING)) {
+      found.push({ kind: 'issue', id: c.id, url: c.html_url || null });
+    }
+  }
+  return found;
+}
+
 /** Is our summary comment currently on the PR? */
 async function hasSummaryComment(octokit, repoInfo) {
   try {
-    const comments = await octokit.paginate(octokit.issues.listComments, {
-      owner: repoInfo.owner, repo: repoInfo.repo,
-      issue_number: repoInfo.pull_number, per_page: 100,
-    });
-    return comments.some(c => String(c.body || '').includes(SUMMARY_HEADING));
+    return (await findSummaryComments(octokit, repoInfo)).length > 0;
   } catch {
     // Cannot tell. Assume it is there rather than risk posting a duplicate:
     // a missing summary is a smaller problem than two of them.
@@ -436,8 +473,135 @@ function nothingNewToSay(plan) {
     && prStillHasOurSummary;
 }
 
-async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
-  const result = { postedInline: 0, postedSummary: false, markedResolved: 0, errors: [] };
+// ── Native "Resolve conversation" ────────────────────────────────────────
+//
+// GitHub's own resolve marks the thread resolved and COLLAPSES it, which is
+// what a reviewer means by "this is handled". Editing the comment body to say
+// "Resolved" only approximated that: the thread stayed open and expanded, the
+// conversation count never moved, and the original finding had to be pushed
+// into a <details> to make room for the notice.
+//
+// There is no REST endpoint for it — resolving a review thread exists only in
+// GraphQL — which is why the first implementation reached for a body edit.
+
+const REVIEW_THREADS_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100) {
+          nodes {
+            id
+            isResolved
+            comments(first: 20) { nodes { body } }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const RESOLVE_THREAD_MUTATION = `
+  mutation($threadId: ID!) {
+    resolveReviewThread(input: { threadId: $threadId }) {
+      thread { id isResolved }
+    }
+  }
+`;
+
+/**
+ * Map fingerprint -> review thread, so a finding can be tied to the thread
+ * that carries it. Returns an empty Map when GraphQL is unavailable, letting
+ * callers fall back rather than fail.
+ */
+async function fetchReviewThreads(octokit, repoInfo) {
+  const byFingerprint = new Map();
+  if (typeof octokit.graphql !== 'function') return byFingerprint;
+
+  try {
+    const data = await octokit.graphql(REVIEW_THREADS_QUERY, {
+      owner: repoInfo.owner,
+      repo: repoInfo.repo,
+      number: repoInfo.pull_number,
+    });
+
+    const threads = data?.repository?.pullRequest?.reviewThreads?.nodes || [];
+    for (const thread of threads) {
+      for (const c of thread?.comments?.nodes || []) {
+        const m = MARKER_RE.exec(c?.body || '');
+        if (m && !byFingerprint.has(m[1])) {
+          byFingerprint.set(m[1], { id: thread.id, isResolved: !!thread.isResolved });
+        }
+      }
+    }
+  } catch {
+    // No GraphQL access, or the schema moved. The caller falls back to editing
+    // the comment body, which is worse but still communicates the outcome.
+  }
+
+  return byFingerprint;
+}
+
+async function resolveReviewThread(octokit, threadId) {
+  await octokit.graphql(RESOLVE_THREAD_MUTATION, { threadId });
+}
+
+/**
+ * Put the summary on the PR: refresh the one already there, or add one if
+ * there is none.
+ *
+ * Both callers need this — the normal no-inline path AND the fallback after an
+ * inline review is rejected — and having two copies of the logic is how the
+ * fallback ended up able to create a duplicate the other path avoided.
+ */
+async function publishSummary(octokit, repoInfo, body, existingSummaries, result) {
+  const existing = existingSummaries || [];
+
+  if (existing.length > 0) {
+    for (const sum of existing) {
+      try {
+        if (sum.kind === 'review') {
+          await octokit.pulls.updateReview({
+            owner: repoInfo.owner, repo: repoInfo.repo,
+            pull_number: repoInfo.pull_number,
+            review_id: sum.id,
+            body,
+          });
+        } else {
+          await octokit.issues.updateComment({
+            owner: repoInfo.owner, repo: repoInfo.repo,
+            comment_id: sum.id,
+            body,
+          });
+        }
+        result.updatedSummaries += 1;
+      } catch (error) {
+        result.errors.push(`summary update failed: ${error.message}`);
+      }
+    }
+    if (result.updatedSummaries > 0) result.postedSummary = true;
+    return;
+  }
+
+  try {
+    await octokit.issues.createComment({
+      owner: repoInfo.owner, repo: repoInfo.repo,
+      issue_number: repoInfo.pull_number,
+      body,
+    });
+    result.postedSummary = true;
+  } catch (error) {
+    result.errors.push(`summary failed: ${error.message}`);
+  }
+}
+
+async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha, existingSummaries } = {}) {
+  const result = {
+    postedInline: 0, postedSummary: false, updatedSummaries: 0,
+    // markedResolved is the total handled; the two below say HOW, since
+    // resolving the thread and editing the body look very different on the PR.
+    markedResolved: 0, resolvedThreads: 0, editedComments: 0,
+    errors: [],
+  };
 
   if (plan.inlineComments.length > 0) {
     try {
@@ -471,30 +635,64 @@ async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
         result.errors.push(`summary fallback failed: ${fallbackError.message}`);
       }
     }
-  } else if (plan.summaryBody && !nothingNewToSay(plan)) {
-    try {
-      await octokit.issues.createComment({
-        owner: repoInfo.owner, repo: repoInfo.repo,
-        issue_number: repoInfo.pull_number,
-        body: plan.summaryBody,
-      });
-      result.postedSummary = true;
-    } catch (error) {
-      result.errors.push(`summary failed: ${error.message}`);
-    }
   } else if (plan.summaryBody) {
-    // Everything selected is already on the PR. Posting the summary anyway
-    // added a duplicate summary comment on every retry.
-    result.skippedAsAlreadyPosted = true;
+    // A summary already on the PR is UPDATED, never duplicated.
+    //
+    // It was previously written once and never touched again, so it kept
+    // saying "16 risks found, reviewed at <old sha>" long after three of them
+    // were fixed — the most prominent thing on the PR, permanently wrong.
+    // Refreshing it in place is both the fix for that and the reason a second
+    // one is never needed.
+    const existing = existingSummaries || [];
+
+    // Refresh what is there. Only skip entirely when there is nothing on the
+    // PR to refresh AND nothing new worth adding.
+    if (existing.length > 0 || !nothingNewToSay(plan)) {
+      await publishSummary(octokit, repoInfo, plan.summaryBody, existing, result);
+    } else {
+      result.skippedAsAlreadyPosted = true;
+    }
   }
 
+  // Prefer GitHub's own "Resolve conversation": it marks the thread resolved
+  // and COLLAPSES it, which is what "handled" looks like to a reviewer, and it
+  // leaves the original finding intact. Editing the body only approximated
+  // that — the thread stayed open, the conversation count never moved, and the
+  // finding had to be pushed into a <details> to make room for the notice.
+  //
+  // Resolving a thread exists only in GraphQL, so a body edit remains the
+  // fallback for when that is unavailable.
+  const threads = plan.resolutions.length > 0
+    ? await fetchReviewThreads(octokit, repoInfo)
+    : new Map();
+
   for (const res of plan.resolutions) {
+    const thread = threads.get(res.fingerprint);
+
+    if (thread && thread.isResolved) {
+      result.markedResolved += 1;   // resolved on an earlier run; nothing to do
+      continue;
+    }
+
+    if (thread) {
+      try {
+        await resolveReviewThread(octokit, thread.id);
+        result.resolvedThreads += 1;
+        result.markedResolved += 1;
+        continue;
+      } catch (error) {
+        // Fall through to the body edit rather than losing the outcome.
+        result.errors.push(`resolve thread ${res.fingerprint}: ${error.message}`);
+      }
+    }
+
     try {
       await octokit.pulls.updateReviewComment({
         owner: repoInfo.owner, repo: repoInfo.repo,
         comment_id: res.commentId,
         body: `✅ **Resolved** — this no longer appears as of \`${String(prHeadSha || '').slice(0, 7)}\`.\n\n<details><summary>Original finding</summary>\n\n${res.body}\n\n</details>`,
       });
+      result.editedComments += 1;
       result.markedResolved += 1;
     } catch (error) {
       result.errors.push(`resolve ${res.fingerprint}: ${error.message}`);
@@ -561,6 +759,9 @@ module.exports = {
   checkIdentity,
   fetchPostedState,
   hasSummaryComment,
+  findSummaryComments,
+  fetchReviewThreads,
+  resolveReviewThread,
   SUMMARY_HEADING,
   fetchPostedFingerprints,
   buildCommentPlan,
