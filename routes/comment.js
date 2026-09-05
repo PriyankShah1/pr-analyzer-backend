@@ -150,7 +150,12 @@ router.post('/', rateLimit, async (req, res) => {
       .filter(([, c]) => c.isReviewComment)
       .map(([fp, c]) => {
         const thread = threads.get(fp);
-        const resolved = c.isResolvedNote || !!(thread && thread.isResolved);
+        // RESOLVED MEANS GITHUB SAYS SO. Nothing else counts. A body edited to
+        // read "Resolved" (how this worked before the GraphQL resolve existed)
+        // sits on a thread that is still open, and reporting it as resolved was
+        // the app telling the reviewer something GitHub disagreed with.
+        const resolved = !!(thread && thread.isResolved);
+        const stillFound = risks.some(r => r.fingerprint === fp);
         return {
           fingerprint: fp,
           title: extractTitleFromBody(c.body) || fp,
@@ -158,10 +163,14 @@ router.post('/', rateLimit, async (req, res) => {
           line: c.line,
           url: c.url,
           status: resolved ? 'resolved' : 'commented',
-          // Only a thread we can see can be resolved from here. A comment
-          // resolved the old way (body edited) has nothing left to click.
-          canResolve: !!thread && !thread.isResolved,
-          stillFound: risks.some(r => r.fingerprint === fp),
+          // Resolving is offered ONLY once the analyzer can no longer find the
+          // problem. Offering it while the code still has the issue lets a
+          // thread be closed on something unfixed, and then the tool reports
+          // it as handled — a claim about the code that is simply false.
+          canResolve: !!thread && !resolved && !stillFound,
+          stillFound,
+          // The old body edit, on a thread GitHub still considers open.
+          legacyResolvedNote: c.isResolvedNote && !resolved,
         };
       })
       .sort((a, b) => Number(a.status === 'resolved') - Number(b.status === 'resolved')
@@ -178,6 +187,16 @@ router.post('/', rateLimit, async (req, res) => {
       const done = [];
       const failed = [];
       for (const fp of resolveOnly) {
+        // Enforced HERE, not only by hiding the button. A finding the analyzer
+        // still reports is by definition not fixed, and closing its thread
+        // would record it as handled when the code says otherwise.
+        if (risks.some(r => r.fingerprint === fp)) {
+          failed.push({
+            fingerprint: fp,
+            reason: 'still present in the code — fix it first, or resolve the thread on GitHub if you disagree with the finding',
+          });
+          continue;
+        }
         const thread = threads.get(fp);
         if (!thread) { failed.push({ fingerprint: fp, reason: 'no open thread found for this finding' }); continue; }
         if (thread.isResolved) { done.push(fp); continue; }
@@ -222,9 +241,13 @@ router.post('/', rateLimit, async (req, res) => {
       ? new Set(fingerprints.filter(fp => typeof fp === 'string' && knownFingerprints.has(fp)))
       : null;
 
+    const resolvedThreadFps = new Set(
+      [...threads.entries()].filter(([, t]) => t.isResolved).map(([fp]) => fp),
+    );
+
     const plan = buildCommentPlan({
       findings: risks, postedFingerprints, prHeadSha, edits: safeEdits, selected,
-      hasSummary,
+      hasSummary, resolvedThreadFps,
     });
 
     // An explicit EMPTY selection means "post nothing inline". Treating it as

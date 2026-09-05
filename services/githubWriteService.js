@@ -304,6 +304,9 @@ async function fetchPostedFingerprints(octokit, repoInfo) {
 function buildCommentPlan({
   findings, postedFingerprints, prHeadSha, edits = {}, selected = null,
   hasSummary = true,
+  // Fingerprints whose GitHub thread is genuinely resolved. This is the ONLY
+  // thing that means "resolved" — see the note where it is used.
+  resolvedThreadFps = new Set(),
 }) {
   // Only a finding anchored to a real added line may be posted inline.
   // reviewService sets anchored:false and diffPosition:null when it could not
@@ -334,9 +337,13 @@ function buildCommentPlan({
   const alreadyResolved = [];
   for (const [fp, comment] of postedFingerprints) {
     if (currentFingerprints.has(fp)) continue;
-    if (comment.isResolvedNote) {
-      // Marked on an earlier run. Reported so the UI can point at it, rather
-      // than only counting it.
+    // "Done" means GitHub's own thread is resolved — NOT that we once edited
+    // the body to say so. The body edit was an approximation from before the
+    // GraphQL resolve existed; a comment carrying that text sits on a thread
+    // that is still open, and treating it as finished left those threads
+    // permanently unresolvable while the UI claimed otherwise.
+    if (resolvedThreadFps.has(fp)) {
+      // Reported so the UI can point at it, rather than only counting it.
       alreadyResolved.push({
         fingerprint: fp,
         title: extractTitleFromBody(comment.body),
