@@ -275,7 +275,19 @@ function buildCommentPlan({
     prHeadSha,
   });
 
+  // A review posted for a CHOSEN SUBSET must not carry the full summary table.
+  // Posting 16 findings one at a time attached the whole 16-row summary to
+  // every one of them, so the PR ended up with the same table repeated 16
+  // times. A partial review gets a one-line body naming what it contains.
+  const isPartial = selected !== null;
+  const reviewBody = isPartial
+    ? `🤖 **PR Analyzer** — ${inlineToPost.length} finding${inlineToPost.length === 1 ? '' : 's'} posted individually. `
+      + 'Run the full review for the complete summary.'
+    : summaryBody;
+
   return {
+    isPartial,
+    reviewBody,
     inlineComments: inlineToPost.map(f => ({
       path: f.file,
       position: f.diffPosition,
@@ -354,7 +366,7 @@ async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
         pull_number: repoInfo.pull_number,
         commit_id: prHeadSha || undefined,
         event: 'COMMENT',       // never REQUEST_CHANGES — a bot must not block a merge
-        body: plan.summaryBody,
+        body: plan.reviewBody ?? plan.summaryBody,
         comments: plan.inlineComments.map(c => ({
           path: c.path,
           position: c.position,

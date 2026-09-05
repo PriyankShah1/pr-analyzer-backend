@@ -10,7 +10,7 @@
 // produces a broken commit in someone's repository, so each is checked for
 // explicitly and rejected rather than patched around.
 
-const { callGeminiJson } = require('./geminiClient');
+const { callGeminiJson, lastGeminiFailure } = require('./geminiClient');
 
 // Lines of surrounding code given to the model. Enough to understand the
 // context; small enough to keep the prompt cheap.
@@ -185,7 +185,16 @@ async function generatePatch(octokit, repoInfo, finding, ref) {
   });
 
   if (!proposal) {
-    return { fingerprint: finding.fingerprint, applicable: false, reason: 'No response from the model' };
+    // Report WHY, not just that nothing came back. Ten identical "No response
+    // from the model" lines told the user nothing; "Gemini quota exceeded" is
+    // immediately actionable.
+    const why = lastGeminiFailure();
+    return {
+      fingerprint: finding.fingerprint,
+      applicable: false,
+      reason: why || 'The model returned nothing for this finding',
+      fatal: !!why && /quota exceeded|rejected the API key|not configured/i.test(why),
+    };
   }
 
   const verified = verifyPatch(file.content, proposal);

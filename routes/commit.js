@@ -214,9 +214,23 @@ router.post('/', rateLimit, async (req, res) => {
 
     // Generate every patch first, so a dry run and a real commit see exactly
     // the same set and the user approves what actually gets written.
+    // Stop on a FATAL model failure instead of repeating it for every finding.
+    // An exhausted quota fails all ten identically, so the other nine calls buy
+    // nothing, waste half a minute, and bury the reason under nine copies.
     const patches = [];
+    let fatalReason = null;
     for (const finding of selected) {
-      patches.push(await generatePatch(octokit, repoInfo, finding, pr.head.sha));
+      if (fatalReason) {
+        patches.push({
+          fingerprint: finding.fingerprint,
+          applicable: false,
+          reason: `Skipped — ${fatalReason}`,
+        });
+        continue;
+      }
+      const patch = await generatePatch(octokit, repoInfo, finding, pr.head.sha);
+      if (patch.fatal) fatalReason = patch.reason;
+      patches.push(patch);
     }
 
     const applicable = patches.filter(p => p.applicable);

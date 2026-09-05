@@ -17,6 +17,41 @@ const DEFAULT_TIMEOUT_MS = 20000;
 // disables it explicitly; none of our tasks need extended reasoning.
 const NO_THINKING = { thinkingBudget: 0 };
 
+// Why the last call produced nothing.
+//
+// Every failure used to collapse into a bare `null`, so a caller could not
+// tell an exhausted free-tier quota from a model that genuinely declined. That
+// surfaced to users as "No response from the model" for all of them — which
+// named the symptom and hid the cause. FATAL failures are worth stopping a
+// batch for; a per-item failure is not.
+let lastFailure = null;
+
+const FATAL_STATUSES = new Set([401, 403, 429]);
+
+function describeFailure(status, body) {
+  const snippet = String(body || '');
+  if (status === 429) {
+    return 'Gemini quota exceeded (429) — the free tier resets daily, or the key needs billing enabled';
+  }
+  if (status === 401 || status === 403) {
+    return `Gemini rejected the API key (${status})`;
+  }
+  if (status >= 500) return `Gemini is unavailable (${status})`;
+  const m = /"message"\s*:\s*"([^"]{0,160})"/.exec(snippet);
+  return `Gemini error ${status}${m ? ` — ${m[1]}` : ''}`;
+}
+
+/** Reason the most recent call returned nothing, or null if it succeeded. */
+function lastGeminiFailure() {
+  return lastFailure;
+}
+
+/** True when retrying other items is pointless — quota or a bad key. */
+function isFatalGeminiFailure(reason) {
+  return typeof reason === 'string'
+    && /quota exceeded|rejected the API key|not configured/i.test(reason);
+}
+
 async function callGemini(prompt, {
   temperature = 0.4,
   maxOutputTokens = 1024,
@@ -26,6 +61,7 @@ async function callGemini(prompt, {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     console.warn('[geminiClient] GEMINI_API_KEY not configured — skipping call');
+    lastFailure = 'GEMINI_API_KEY is not configured on the server';
     return null;
   }
 
@@ -52,6 +88,7 @@ async function callGemini(prompt, {
     if (!response.ok) {
       const errBody = await response.text();
       console.error(`[geminiClient] API error ${response.status}:`, errBody.slice(0, 200));
+      lastFailure = describeFailure(response.status, errBody);
       return null;
     }
 
@@ -63,9 +100,19 @@ async function callGemini(prompt, {
     }
 
     const text = candidate?.content?.parts?.[0]?.text;
-    return text ? text.trim() : null;
+    if (!text) {
+      lastFailure = candidate?.finishReason === 'MAX_TOKENS'
+        ? 'the model hit its output limit before producing an answer'
+        : 'the model returned an empty response';
+      return null;
+    }
+    lastFailure = null;
+    return text.trim();
 
   } catch (error) {
+    lastFailure = error.name === 'TimeoutError'
+      ? `the model did not answer within ${timeoutMs / 1000}s`
+      : `could not reach the model (${error.message})`;
     console.error('[geminiClient] call failed:', error.message);
     return null;
   }
@@ -99,4 +146,7 @@ async function callGeminiJson(prompt, options = {}) {
   }
 }
 
-module.exports = { callGemini, callGeminiJson, GEMINI_MODEL };
+module.exports = {
+  callGemini, callGeminiJson, GEMINI_MODEL,
+  lastGeminiFailure, isFatalGeminiFailure, FATAL_STATUSES,
+};
