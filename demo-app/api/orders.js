@@ -6,7 +6,7 @@ async function findOrdersByCustomer(customerId) {
 }
 
 async function purgeCancelled() {
-  return db.query('DELETE FROM orders');
+  return db.query('DELETE FROM orders WHERE status = $1', ['cancelled']);
 }
 
 async function listAll() {
