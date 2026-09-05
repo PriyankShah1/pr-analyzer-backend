@@ -19,6 +19,8 @@ app.use('/health',  require('./routes/health'));
 app.use('/files',   require('./routes/files'));
 app.use('/analyze', require('./routes/analyze'));
 app.use('/explain', require('./routes/explain')); // ← NEW: AI explanation
+app.use('/comment', require('./routes/comment')); // v6: post findings to the PR
+app.use('/commit',  require('./routes/commit'));  // v6: suggest + apply fixes
 
 // ── 404 handler ───────────────────────────────────────────────────────────
 app.use((req, res) => {

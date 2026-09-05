@@ -29,7 +29,14 @@ async function fetchPRDetails(repoInfo, token) {
     prAuthor: prDetailsRes.data.user?.login || null,
     prState:  prDetailsRes.data.state,
     prMerged: prDetailsRes.data.merged || false,
-    files:    filesRes.data,
+    // Head SHA identifies WHICH revision of the PR was reviewed. The risk
+    // registry keys on it to answer "was this finding fixed since last time?"
+    // — without it, two reviews of the same PR are indistinguishable.
+    prHeadSha:  prDetailsRes.data.head?.sha || null,
+    prBaseSha:  prDetailsRes.data.base?.sha || null,
+    prRepo:     prDetailsRes.data.base?.repo?.full_name || `${repoInfo.owner}/${repoInfo.repo}`,
+    prCommits:  prDetailsRes.data.commits ?? null,
+    files:      filesRes.data,
   };
 }
 

@@ -21,8 +21,14 @@ function setCached(key, data) {
   cache.set(key, { data, timestamp: Date.now() });
 }
 
+// Used after a write (a committed fix) makes a cached analysis stale. Storing
+// null would work but would leave a dead entry holding a slot in the LRU.
+function invalidateCached(key) {
+  return cache.delete(key);
+}
+
 function getCacheSize() {
   return cache.size;
 }
 
-module.exports = { getCached, setCached, getCacheSize, CACHE_TTL_MS, CACHE_MAX };
+module.exports = { getCached, setCached, invalidateCached, getCacheSize, CACHE_TTL_MS, CACHE_MAX };

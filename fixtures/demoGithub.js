@@ -1,0 +1,144 @@
+// fixtures/demoGithub.js
+//
+// A stand-in Octokit for the built-in demo PR, so the write-path PLANNING in
+// §4 (comment) and §6 (commit) can be exercised with no PAT and no network.
+//
+// The safety property this file exists to guarantee:
+//
+//   THERE IS NO CODE PATH FROM THE DEMO TO A REAL GITHUB WRITE.
+//
+// `github.com/test/test` may well be a real repository owned by a real
+// person. A demo that merely *failed* to write there would be relying on a
+// permission check it does not control. So every mutating method here throws
+// instead of being merely absent — a future caller that reaches for one gets
+// a loud error, not an undefined-is-not-a-function that some try/catch
+// swallows into a misleading "posted successfully".
+//
+// Read methods return fixture data shaped exactly like the real API responses
+// the callers destructure, so the planners run their genuine logic.
+
+const { getDemoPRDetails, getDemoFileContent } = require('./demoPR');
+
+function refuseWrite(method) {
+  return () => {
+    throw new Error(
+      `Demo PR: refusing to call ${method} against a real repository. `
+      + 'The demo exercises planning only; confirmed writes are rejected before this point.',
+    );
+  };
+}
+
+/**
+ * Minimal Octokit surface for the demo.
+ *
+ * Only the methods the read/plan paths actually call are implemented. Anything
+ * that mutates is present but throws, per the note above.
+ */
+function createDemoOctokit() {
+  const pr = getDemoPRDetails();
+
+  return {
+    // Real Octokit exposes `paginate` to walk multi-page list endpoints, and
+    // fetchPostedFingerprints() calls it — a demo without it fails the whole
+    // comment path. Fixture lists are single-page, so this unwraps `.data`.
+    paginate: async (method, params) => {
+      const res = await method(params);
+      return res.data;
+    },
+
+    // ── reads the planners rely on ──────────────────────────────────────
+    pulls: {
+      get: async () => ({
+        data: {
+          title: pr.prTitle,
+          number: pr.prNumber,
+          state: pr.prState,
+          merged: pr.prMerged,
+          user: { login: pr.prAuthor },
+          commits: pr.prCommits,
+          head: {
+            sha: pr.prHeadSha,
+            ref: 'demo/checkout-rework',
+            repo: { full_name: pr.prRepo },
+          },
+          base: {
+            sha: pr.prBaseSha,
+            ref: 'main',
+            repo: { full_name: pr.prRepo },
+          },
+        },
+      }),
+
+      listFiles: async () => ({ data: pr.files }),
+
+      // No analyzer comment has ever been posted to the fixture, so the
+      // idempotency check correctly sees a clean slate and plans every
+      // finding as new. That is the honest state, not a convenience.
+      listReviewComments: async () => ({ data: [] }),
+
+      createReviewComment: refuseWrite('pulls.createReviewComment'),
+      createReview: refuseWrite('pulls.createReview'),
+      updateReviewComment: refuseWrite('pulls.updateReviewComment'),
+    },
+
+    issues: {
+      listComments: async () => ({ data: [] }),
+      createComment: refuseWrite('issues.createComment'),
+      updateComment: refuseWrite('issues.updateComment'),
+    },
+
+    users: {
+      // checkIdentity() calls this. The demo has no real account behind it.
+      getAuthenticated: async () => ({ data: { login: 'demo-user' } }),
+    },
+
+    repos: {
+      // The commit path anchors a patch in the file's real text. For a wholly
+      // added fixture file that text is exactly its added lines.
+      getContent: async ({ path }) => {
+        const content = getDemoFileContent(path);
+        if (content === null) {
+          const err = new Error(`Not Found: ${path}`);
+          err.status = 404;
+          throw err;
+        }
+        return {
+          data: {
+            type: 'file',
+            path,
+            size: Buffer.byteLength(content, 'utf8'),
+            content: Buffer.from(content, 'utf8').toString('base64'),
+            sha: `demo-blob-${Buffer.from(path).toString('hex').slice(0, 12)}`,
+          },
+        };
+      },
+
+      get: async () => ({
+        data: { full_name: pr.prRepo, permissions: { push: true, admin: false } },
+      }),
+    },
+
+    git: {
+      createBlob: refuseWrite('git.createBlob'),
+      createTree: refuseWrite('git.createTree'),
+      createCommit: refuseWrite('git.createCommit'),
+      updateRef: refuseWrite('git.updateRef'),
+      getRef: async () => ({ data: { object: { sha: pr.prHeadSha } } }),
+    },
+  };
+}
+
+/**
+ * The refusal every write route returns when asked to CONFIRM against the
+ * demo. Kept here so both routes word it identically.
+ */
+const DEMO_CONFIRM_REFUSAL = {
+  error: 'The demo PR is a local fixture, not a real pull request — there is nothing to write to.',
+  detail:
+    'Dry runs work fully: you get the exact comment plan and the exact patches the analyzer would '
+    + 'apply, generated by the same code that runs against a real PR. Confirming is refused because '
+    + 'github.com/test/test is not yours to write to. Point the tool at a real PR with a write-scoped '
+    + 'token to exercise the confirmed path.',
+};
+
+module.exports = { createDemoOctokit, DEMO_CONFIRM_REFUSAL };
