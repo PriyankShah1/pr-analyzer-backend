@@ -33,6 +33,7 @@ const { handleGitHubError } = require('./errorHandler');
 const {
   createOctokit, fetchPostedState, buildCommentPlan,
   executeCommentPlan, checkIdentity, findSummaryComments,
+  fetchReviewThreads, resolveReviewThread, extractTitleFromBody,
 } = require('../services/githubWriteService');
 const { isDemoPR, getDemoPRDetails } = require('../fixtures/demoPR');
 const { createDemoOctokit, DEMO_CONFIRM_REFUSAL } = require('../fixtures/demoGithub');
@@ -79,13 +80,16 @@ async function deriveRisks(url, repoInfo, token, wantsReview = false) {
 
   result.aiFindings = aiFindings;
   result.risks = risks;
-  setCached(cacheKey, result);
+  // Never cache the demo. routes/analyze.js deliberately skips the cache for
+  // it so each Refresh advances a revision; caching it HERE put it back, and
+  // analyze then served a frozen revision from a write route's leftovers.
+  if (!isDemoPR(repoInfo)) setCached(cacheKey, result);
 
   return { risks, prHeadSha, fromCache: false };
 }
 
 router.post('/', rateLimit, async (req, res) => {
-  const { url, token, confirm, aiReview, edits, fingerprints } = req.body || {};
+  const { url, token, confirm, aiReview, edits, fingerprints, resolveOnly } = req.body || {};
 
   let repoInfo;
   try {
@@ -128,6 +132,77 @@ router.post('/', rateLimit, async (req, res) => {
 
     const { risks, prHeadSha } = await deriveRisks(url, repoInfo, demo ? undefined : token.trim(), aiReview === true);
     const { posted: postedFingerprints, hasSummary } = await fetchPostedState(octokit, repoInfo);
+
+    // Thread state, so the client can show what is on the PR and resolve any
+    // of it by hand. Needed on a dry run too: the point is to LOOK at the
+    // review, which a reviewer does long after they stopped writing it.
+    const threads = await fetchReviewThreads(octokit, repoInfo).catch(() => new Map());
+
+    /**
+     * The standing record of this review on the PR: every finding commented
+     * on, and whether its thread is resolved.
+     *
+     * Without it the only answer to "what did I flag yesterday?" was to scroll
+     * a diff, and "13 findings already commented on" was a number with nothing
+     * behind it.
+     */
+    const onPR = [...postedFingerprints.entries()]
+      .filter(([, c]) => c.isReviewComment)
+      .map(([fp, c]) => {
+        const thread = threads.get(fp);
+        const resolved = c.isResolvedNote || !!(thread && thread.isResolved);
+        return {
+          fingerprint: fp,
+          title: extractTitleFromBody(c.body) || fp,
+          path: c.path,
+          line: c.line,
+          url: c.url,
+          status: resolved ? 'resolved' : 'commented',
+          // Only a thread we can see can be resolved from here. A comment
+          // resolved the old way (body edited) has nothing left to click.
+          canResolve: !!thread && !thread.isResolved,
+          stillFound: risks.some(r => r.fingerprint === fp),
+        };
+      })
+      .sort((a, b) => Number(a.status === 'resolved') - Number(b.status === 'resolved')
+                   || a.path.localeCompare(b.path)
+                   || (a.line || 0) - (b.line || 0));
+
+    // ── Manual resolve: the reviewer decided a thread is handled ──────────
+    // Separate from the finding-driven path on purpose. That one resolves what
+    // the analyzer proved is gone; this one records a human judgement, which
+    // may be "fixed differently" or "not a real problem here".
+    if (confirm === true && Array.isArray(resolveOnly) && resolveOnly.length > 0) {
+      if (demo) return res.status(400).json(DEMO_CONFIRM_REFUSAL);
+
+      const done = [];
+      const failed = [];
+      for (const fp of resolveOnly) {
+        const thread = threads.get(fp);
+        if (!thread) { failed.push({ fingerprint: fp, reason: 'no open thread found for this finding' }); continue; }
+        if (thread.isResolved) { done.push(fp); continue; }
+        try {
+          await resolveReviewThread(octokit, thread.id);
+          done.push(fp);
+        } catch (error) {
+          failed.push({ fingerprint: fp, reason: error.message });
+        }
+      }
+
+      if (done.length === 0) {
+        return res.status(502).json({
+          error: failed[0] ? `Could not resolve: ${failed[0].reason}` : 'Nothing was resolved.',
+          failed,
+        });
+      }
+
+      return res.json({
+        dryRun: false,
+        resolvedFingerprints: done,
+        failed: failed.length ? failed : undefined,
+        message: `Resolved ${done.length} conversation${done.length === 1 ? '' : 's'} on the PR.`,
+      });
+    }
     // Reviewer rewrites, keyed by fingerprint. Only edits for findings THIS
     // server just derived are honoured — an unknown key is dropped, so the
     // request body cannot introduce a comment that has no finding behind it.
@@ -191,6 +266,9 @@ router.post('/', rateLimit, async (req, res) => {
           skipped: plan.skipped,
           counts: plan.counts,
         },
+        // Everything this review has already put on the PR, with its current
+        // state — the standing record, not just what is about to change.
+        onPR,
         // Say exactly what will happen, including whether a summary posts.
         // "Would post 0 inline comment(s), 1 summary, and mark 3 as resolved"
         // promised a summary that is now correctly skipped, and buried the one

@@ -70,7 +70,10 @@ async function deriveRisks(url, repoInfo, token, wantsReview = false) {
   result.risks = [...(result.sqlFindings || []), ...result.graphFindings, ...aiFindings]
     .sort((a, b) => a.severityRank - b.severityRank || b.confidence - a.confidence);
 
-  setCached(cacheKey, result);
+  // Never cache the demo. routes/analyze.js deliberately skips the cache for
+  // it so each Refresh advances a revision; caching it HERE put it back, and
+  // analyze then served a frozen revision from a write route's leftovers.
+  if (!isDemoPR(repoInfo)) setCached(cacheKey, result);
   return result.risks;
 }
 

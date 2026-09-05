@@ -762,6 +762,7 @@ module.exports = {
   findSummaryComments,
   fetchReviewThreads,
   resolveReviewThread,
+  extractTitleFromBody,
   SUMMARY_HEADING,
   fetchPostedFingerprints,
   buildCommentPlan,
