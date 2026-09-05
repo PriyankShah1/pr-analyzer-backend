@@ -348,20 +348,29 @@ function extractPathFromBody() {
  * either lands or it doesn't.
  */
 /**
- * True when the plan has nothing the PR does not already carry: no new inline
- * comment, nothing to mark resolved, and at least one finding skipped because
- * it was already posted.
+ * True when a summary comment would add nothing the PR does not already carry.
  *
- * Without this, retrying a comment that is already on the PR posted ANOTHER
- * summary comment each time — the one action guaranteed to add noise while
- * changing nothing. An unanchored-only plan is different: there the summary IS
- * how the finding gets delivered, so it must still post.
+ * The summary exists to introduce findings. It is posted as the BODY of the
+ * review that carries new inline comments, and separately only when a finding
+ * has no other way to reach the PR. Two cases must not post one:
+ *
+ *   - Retrying a comment already on the PR. Nothing changed, so another
+ *     summary is pure noise.
+ *   - Marking findings resolved. The resolution is already visible on the
+ *     comments themselves, which get edited in place; a second full table
+ *     repeating the previous review's contents just buries them.
+ *
+ * An unanchored-only plan is different: there the summary IS how the finding
+ * gets delivered, so it must still post. So must a genuine first review, where
+ * the PR carries nothing of ours yet.
  */
 function nothingNewToSay(plan) {
-  return plan.inlineComments.length === 0
-    && plan.resolutions.length === 0
-    && (plan.counts.alreadyPosted || 0) > 0
-    && (plan.counts.unanchored || 0) === 0;
+  const nothingNewInline = plan.inlineComments.length === 0;
+  const nothingOnlyDeliverableBySummary = (plan.counts.unanchored || 0) === 0;
+  const prAlreadyHasOurComments =
+    (plan.counts.alreadyPosted || 0) > 0 || plan.resolutions.length > 0;
+
+  return nothingNewInline && nothingOnlyDeliverableBySummary && prAlreadyHasOurComments;
 }
 
 async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {

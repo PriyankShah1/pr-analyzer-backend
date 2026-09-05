@@ -186,9 +186,25 @@ router.post('/', rateLimit, async (req, res) => {
           skipped: plan.skipped,
           counts: plan.counts,
         },
-        message: plan.counts.willPostInline === 0 && plan.counts.willMarkResolved === 0
-          ? 'Nothing new to post — every current finding has already been commented on.'
-          : `Would post ${plan.counts.willPostInline} inline comment(s), 1 summary, and mark ${plan.counts.willMarkResolved} as resolved.`,
+        // Say exactly what will happen, including whether a summary posts.
+        // "Would post 0 inline comment(s), 1 summary, and mark 3 as resolved"
+        // promised a summary that is now correctly skipped, and buried the one
+        // thing actually happening.
+        message: (() => {
+          const posts = plan.counts.willPostInline;
+          const marks = plan.counts.willMarkResolved;
+          if (posts === 0 && marks === 0) {
+            return 'Nothing new to post — every current finding has already been commented on.';
+          }
+          if (posts === 0) {
+            return `Nothing new to post. ${marks} finding${marks === 1 ? '' : 's'} `
+              + `${marks === 1 ? 'has' : 'have'} been fixed — their existing comments will be `
+              + 'marked resolved in place.';
+          }
+          const parts = [`${posts} inline comment${posts === 1 ? '' : 's'}`, 'a summary'];
+          const tail = marks > 0 ? `, and ${marks} marked resolved` : '';
+          return `Would post ${parts.join(' and ')}${tail}.`;
+        })(),
       });
     }
 
