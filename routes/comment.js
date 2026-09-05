@@ -181,14 +181,39 @@ router.post('/', rateLimit, async (req, res) => {
 
     const outcome = await executeCommentPlan(octokit, repoInfo, plan, { prHeadSha });
 
+    const wroteSomething = outcome.postedInline > 0
+      || outcome.postedSummary
+      || outcome.markedResolved > 0;
+
+    // executeCommentPlan collects GitHub's errors instead of throwing, so that
+    // one failed inline comment cannot lose the whole review. That is right,
+    // but the route used to return 200 with "Posted 0 inline comment(s)" and
+    // DROP outcome.errors — so a rejected write looked identical to a
+    // successful one and the actual reason never left the server.
+    if (!wroteSomething) {
+      return res.status(502).json({
+        error: outcome.errors[0]
+          ? `GitHub rejected the write: ${outcome.errors[0]}`
+          : 'Nothing was written and GitHub reported no reason.',
+        detail: 'A token needs Pull requests: Read and write to post a review. '
+          + 'A fine-grained token also has to list this repository under its access.',
+        errors: outcome.errors,
+        posted: outcome,
+      });
+    }
+
     return res.json({
       dryRun: false,
       prHeadSha,
       posted: outcome,
       counts: plan.counts,
+      // Partial failures are reported, not hidden: some comments can land while
+      // others are rejected for a stale position.
+      errors: outcome.errors.length > 0 ? outcome.errors : undefined,
       message: `Posted ${outcome.postedInline} inline comment(s)`
         + `${outcome.postedSummary ? ' and a summary' : ''}`
-        + `${outcome.markedResolved ? `, marked ${outcome.markedResolved} resolved` : ''}.`,
+        + `${outcome.markedResolved ? `, marked ${outcome.markedResolved} resolved` : ''}.`
+        + `${outcome.errors.length > 0 ? ` ${outcome.errors.length} failed — see errors.` : ''}`,
     });
 
   } catch (error) {
