@@ -31,7 +31,7 @@ const { generateReview }   = require('../services/reviewService');
 const { buildGraphFindings } = require('../services/graphFindings');
 const { handleGitHubError } = require('./errorHandler');
 const {
-  createOctokit, fetchPostedFingerprints, buildCommentPlan,
+  createOctokit, fetchPostedState, buildCommentPlan,
   executeCommentPlan, checkIdentity,
 } = require('../services/githubWriteService');
 const { isDemoPR, getDemoPRDetails } = require('../fixtures/demoPR');
@@ -127,7 +127,7 @@ router.post('/', rateLimit, async (req, res) => {
     }
 
     const { risks, prHeadSha } = await deriveRisks(url, repoInfo, demo ? undefined : token.trim(), aiReview === true);
-    const postedFingerprints = await fetchPostedFingerprints(octokit, repoInfo);
+    const { posted: postedFingerprints, hasSummary } = await fetchPostedState(octokit, repoInfo);
     // Reviewer rewrites, keyed by fingerprint. Only edits for findings THIS
     // server just derived are honoured — an unknown key is dropped, so the
     // request body cannot introduce a comment that has no finding behind it.
@@ -149,6 +149,7 @@ router.post('/', rateLimit, async (req, res) => {
 
     const plan = buildCommentPlan({
       findings: risks, postedFingerprints, prHeadSha, edits: safeEdits, selected,
+      hasSummary,
     });
 
     // An explicit EMPTY selection means "post nothing inline". Treating it as
@@ -194,7 +195,17 @@ router.post('/', rateLimit, async (req, res) => {
           const posts = plan.counts.willPostInline;
           const marks = plan.counts.willMarkResolved;
           if (posts === 0 && marks === 0) {
-            return 'Nothing new to post — every current finding has already been commented on.';
+            // Terse is not the same as helpful. Report what IS on the PR, so
+            // "nothing to do" reads as a finished state rather than a refusal.
+            const already = plan.counts.alreadyPosted || 0;
+            const resolvedAlready = [...postedFingerprints.values()]
+              .filter(c => c.isResolvedNote).length;
+            const parts = [];
+            if (already) parts.push(`${already} finding${already === 1 ? '' : 's'} already commented on`);
+            if (resolvedAlready) parts.push(`${resolvedAlready} already marked resolved`);
+            return parts.length
+              ? `Everything is already on the PR — ${parts.join(', ')}. Nothing left to write.`
+              : 'Nothing to post — no finding in this analysis can be anchored to a diff line.';
           }
           if (posts === 0) {
             return `Nothing new to post. ${marks} finding${marks === 1 ? '' : 's'} `

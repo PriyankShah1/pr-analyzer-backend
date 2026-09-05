@@ -17,6 +17,12 @@ const { Octokit } = require('@octokit/rest');
 
 // Invisible in rendered Markdown, greppable in the raw body.
 const MARKER_PREFIX = 'pr-analyzer:fp=';
+
+// The summary carries no fingerprint marker, so its presence is detected by
+// its heading. That matters: whether the PR CURRENTLY has a summary is a
+// different question from whether we ever posted one, and only the first can
+// tell a deleted summary apart from a duplicate about to be created.
+const SUMMARY_HEADING = '## 🤖 PR Analyzer review';
 const MARKER_RE = /<!--\s*pr-analyzer:fp=([0-9a-f]{6,64})\s*-->/;
 
 // Hard caps. A PR with 200 findings should not produce 200 notifications.
@@ -123,7 +129,7 @@ function buildSummaryBody({ anchored, unanchored, resolvedNow, prHeadSha }) {
     counts[f.severity] = (counts[f.severity] || 0) + 1;
   }
 
-  const lines = ['## 🤖 PR Analyzer review', ''];
+  const lines = [SUMMARY_HEADING, ''];
 
   if (total === 0 && resolvedNow.length === 0) {
     lines.push('No risks found in the changed code.');
@@ -180,6 +186,34 @@ function buildSummaryBody({ anchored, unanchored, resolvedNow, prHeadSha }) {
 // ── Reading back what we already posted ───────────────────────────────────
 
 // Returns Map<fingerprint, { id, body, path, line, isResolvedNote }>.
+/**
+ * What our previous reviews left on this PR: which findings are commented on,
+ * and whether the summary is still there.
+ *
+ * One pass, because both answers come from the same two comment lists and the
+ * plan needs them together.
+ */
+async function fetchPostedState(octokit, repoInfo) {
+  const posted = await fetchPostedFingerprints(octokit, repoInfo);
+  const hasSummary = await hasSummaryComment(octokit, repoInfo);
+  return { posted, hasSummary };
+}
+
+/** Is our summary comment currently on the PR? */
+async function hasSummaryComment(octokit, repoInfo) {
+  try {
+    const comments = await octokit.paginate(octokit.issues.listComments, {
+      owner: repoInfo.owner, repo: repoInfo.repo,
+      issue_number: repoInfo.pull_number, per_page: 100,
+    });
+    return comments.some(c => String(c.body || '').includes(SUMMARY_HEADING));
+  } catch {
+    // Cannot tell. Assume it is there rather than risk posting a duplicate:
+    // a missing summary is a smaller problem than two of them.
+    return true;
+  }
+}
+
 async function fetchPostedFingerprints(octokit, repoInfo) {
   const posted = new Map();
 
@@ -228,6 +262,7 @@ async function fetchPostedFingerprints(octokit, repoInfo) {
  */
 function buildCommentPlan({
   findings, postedFingerprints, prHeadSha, edits = {}, selected = null,
+  hasSummary = true,
 }) {
   // Only a finding anchored to a real added line may be posted inline.
   // reviewService sets anchored:false and diffPosition:null when it could not
@@ -288,6 +323,7 @@ function buildCommentPlan({
   // Posting 16 findings one at a time attached the whole 16-row summary to
   // every one of them, so the PR ended up with the same table repeated 16
   // times. A partial review gets a one-line body naming what it contains.
+  const planHasSummary = hasSummary;
   const isPartial = selected !== null;
   const reviewBody = isPartial
     ? `🤖 **PR Analyzer** — ${inlineToPost.length} finding${inlineToPost.length === 1 ? '' : 's'} posted individually. `
@@ -296,6 +332,7 @@ function buildCommentPlan({
 
   return {
     isPartial,
+    hasSummary: planHasSummary,
     reviewBody,
     inlineComments: inlineToPost.map(f => ({
       path: f.file,
@@ -370,7 +407,15 @@ function nothingNewToSay(plan) {
   const prAlreadyHasOurComments =
     (plan.counts.alreadyPosted || 0) > 0 || plan.resolutions.length > 0;
 
-  return nothingNewInline && nothingOnlyDeliverableBySummary && prAlreadyHasOurComments;
+  // If the summary is GONE from the PR — deleted by hand, say — posting one
+  // is not a duplicate, it is a restore. Keying this off "did we ever post?"
+  // instead of "is one there now?" made a deleted summary unrecoverable.
+  const prStillHasOurSummary = plan.hasSummary !== false;
+
+  return nothingNewInline
+    && nothingOnlyDeliverableBySummary
+    && prAlreadyHasOurComments
+    && prStillHasOurSummary;
 }
 
 async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
@@ -496,6 +541,9 @@ module.exports = {
   MAX_EDIT_CHARS,
   createOctokit,
   checkIdentity,
+  fetchPostedState,
+  hasSummaryComment,
+  SUMMARY_HEADING,
   fetchPostedFingerprints,
   buildCommentPlan,
   executeCommentPlan,
