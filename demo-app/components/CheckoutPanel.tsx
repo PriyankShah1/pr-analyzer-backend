@@ -11,7 +11,7 @@ export function CheckoutPanel({ cartId }: { cartId: string }) {
 
   return (
     <div className="checkout-panel">
-      <OrderSummary total={total} itemCount="3" />
+      <OrderSummary total={total} itemCount={3} />
       <PromoBanner code={cartId} discountPercent={10} />
     </div>
   );
