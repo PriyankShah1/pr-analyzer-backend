@@ -2,8 +2,7 @@ const db = require('../db');
 const prisma = require('../prisma');
 
 async function findOrdersByCustomer(customerId) {
-  const sql = `SELECT id, total, status FROM orders WHERE customer_id = ${customerId}`;
-  return db.query(sql);
+  return db.query('SELECT id, total, status FROM orders WHERE customer_id = $1', [customerId]);
 }
 
 async function purgeCancelled() {
