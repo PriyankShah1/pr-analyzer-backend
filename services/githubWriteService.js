@@ -326,6 +326,23 @@ function extractPathFromBody() {
  * a single notification for the author instead of a mailbox full, and it
  * either lands or it doesn't.
  */
+/**
+ * True when the plan has nothing the PR does not already carry: no new inline
+ * comment, nothing to mark resolved, and at least one finding skipped because
+ * it was already posted.
+ *
+ * Without this, retrying a comment that is already on the PR posted ANOTHER
+ * summary comment each time — the one action guaranteed to add noise while
+ * changing nothing. An unanchored-only plan is different: there the summary IS
+ * how the finding gets delivered, so it must still post.
+ */
+function nothingNewToSay(plan) {
+  return plan.inlineComments.length === 0
+    && plan.resolutions.length === 0
+    && (plan.counts.alreadyPosted || 0) > 0
+    && (plan.counts.unanchored || 0) === 0;
+}
+
 async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
   const result = { postedInline: 0, postedSummary: false, markedResolved: 0, errors: [] };
 
@@ -361,7 +378,7 @@ async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
         result.errors.push(`summary fallback failed: ${fallbackError.message}`);
       }
     }
-  } else if (plan.summaryBody) {
+  } else if (plan.summaryBody && !nothingNewToSay(plan)) {
     try {
       await octokit.issues.createComment({
         owner: repoInfo.owner, repo: repoInfo.repo,
@@ -372,6 +389,10 @@ async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha } = {}) {
     } catch (error) {
       result.errors.push(`summary failed: ${error.message}`);
     }
+  } else if (plan.summaryBody) {
+    // Everything selected is already on the PR. Posting the summary anyway
+    // added a duplicate summary comment on every retry.
+    result.skippedAsAlreadyPosted = true;
   }
 
   for (const res of plan.resolutions) {

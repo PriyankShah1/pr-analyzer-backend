@@ -181,9 +181,17 @@ router.post('/', rateLimit, async (req, res) => {
 
     const outcome = await executeCommentPlan(octokit, repoInfo, plan, { prHeadSha });
 
+    // "Already on the PR" is a SUCCESS, not a failure. fetchPostedFingerprints
+    // only returns a fingerprint it read back out of a real comment body on
+    // GitHub, so its presence proves the comment is there. Reporting that as
+    // "nothing was posted" told the user their comment had failed when it had
+    // in fact worked.
+    const alreadyPosted = plan.skipped.alreadyPosted || [];
+
     const wroteSomething = outcome.postedInline > 0
       || outcome.postedSummary
-      || outcome.markedResolved > 0;
+      || outcome.markedResolved > 0
+      || alreadyPosted.length > 0;
 
     // executeCommentPlan collects GitHub's errors instead of throwing, so that
     // one failed inline comment cannot lose the whole review. That is right,
@@ -207,10 +215,15 @@ router.post('/', rateLimit, async (req, res) => {
       prHeadSha,
       posted: outcome,
       counts: plan.counts,
+      // Which findings were skipped because the PR already carries them, so
+      // the client can mark those rows done rather than failed.
+      alreadyPosted,
       // Partial failures are reported, not hidden: some comments can land while
       // others are rejected for a stale position.
       errors: outcome.errors.length > 0 ? outcome.errors : undefined,
-      message: `Posted ${outcome.postedInline} inline comment(s)`
+      message: outcome.postedInline === 0 && alreadyPosted.length > 0
+        ? `Already on this PR — ${alreadyPosted.length} finding(s) were commented on previously, so nothing was duplicated.`
+        : `Posted ${outcome.postedInline} inline comment(s)`
         + `${outcome.postedSummary ? ' and a summary' : ''}`
         + `${outcome.markedResolved ? `, marked ${outcome.markedResolved} resolved` : ''}.`
         + `${outcome.errors.length > 0 ? ` ${outcome.errors.length} failed — see errors.` : ''}`,
