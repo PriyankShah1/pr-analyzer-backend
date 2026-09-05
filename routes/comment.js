@@ -147,17 +147,24 @@ router.post('/', rateLimit, async (req, res) => {
       ? new Set(fingerprints.filter(fp => typeof fp === 'string' && knownFingerprints.has(fp)))
       : null;
 
+    const plan = buildCommentPlan({
+      findings: risks, postedFingerprints, prHeadSha, edits: safeEdits, selected,
+    });
+
     // An explicit EMPTY selection means "post nothing inline". Treating it as
     // "post everything" would post comments the reviewer just unticked.
-    if (selected && selected.size === 0 && confirm === true) {
+    //
+    // Resolutions are the exception: marking a previously-posted finding as
+    // fixed is a write with nothing to select, so refusing an empty selection
+    // made that path unreachable whenever every current finding was already
+    // commented on — which is exactly the state a PR reaches after the fixes
+    // land.
+    if (selected && selected.size === 0 && confirm === true
+        && plan.resolutions.length === 0) {
       return res.status(400).json({
         error: 'No comments selected. Tick at least one finding to post, or cancel.',
       });
     }
-
-    const plan = buildCommentPlan({
-      findings: risks, postedFingerprints, prHeadSha, edits: safeEdits, selected,
-    });
 
     // Dry run — return the plan verbatim and write nothing.
     if (confirm !== true) {
@@ -169,7 +176,13 @@ router.post('/', rateLimit, async (req, res) => {
           // and what the reviewer approves is literally what gets written.
           inlineComments: plan.inlineComments,
           summaryBody: plan.summaryBody,
-          resolutions: plan.resolutions.map(r => ({ fingerprint: r.fingerprint })),
+          // Titles too: "3 will be marked resolved" is not checkable, and the
+          // reviewer is about to authorise an edit to comments already on the PR.
+          resolutions: plan.resolutions.map(r => ({
+            fingerprint: r.fingerprint,
+            title: r.title,
+            path: r.path,
+          })),
           skipped: plan.skipped,
           counts: plan.counts,
         },

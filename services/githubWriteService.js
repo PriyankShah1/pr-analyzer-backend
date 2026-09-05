@@ -259,7 +259,16 @@ function buildCommentPlan({
     if (currentFingerprints.has(fp)) continue;
     if (comment.isResolvedNote) continue;      // already marked
     if (!comment.isReviewComment) continue;    // summary comment, not a finding
-    toMarkResolved.push({ fingerprint: fp, commentId: comment.id, body: comment.body });
+    toMarkResolved.push({
+      fingerprint: fp,
+      commentId: comment.id,
+      body: comment.body,
+      // Carried so the dry run can NAME what it will edit. "3 will be marked
+      // resolved" is not something a reviewer can check before authorising an
+      // edit to comments already on their PR.
+      title: extractTitleFromBody(comment.body),
+      path: comment.path || null,
+    });
   }
 
   const truncated = Math.max(0, newInline.length - MAX_INLINE_COMMENTS);
