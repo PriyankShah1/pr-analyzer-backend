@@ -189,7 +189,16 @@ router.post('/', rateLimit, async (req, res) => {
     const access = demo ? { canWrite: true } : await checkWriteAccess(octokit, repoInfo);
     if (!access.canWrite) {
       return res.status(403).json({
-        error: 'This token cannot write to that repository. It needs the `repo` scope and push access.',
+        error: 'This token cannot write to that repository.',
+        // Same trap as routes/comment.js: "Public repositories" access on a
+        // fine-grained token is read-only, so no Repository permissions
+        // section is offered and there is nothing on screen explaining the
+        // refusal. Committing needs Contents write on top of that.
+        detail: 'Fine-grained token: Repository access must be "Only select repositories" '
+          + '(or "All repositories") and include this repo — "Public repositories" is '
+          + 'read-only. Then set Contents: Read and write (a commit writes to the head '
+          + 'branch) and Pull requests: Read. '
+          + 'Classic token: needs the repo scope and push access.',
       });
     }
 

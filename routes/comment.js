@@ -203,8 +203,16 @@ router.post('/', rateLimit, async (req, res) => {
         error: outcome.errors[0]
           ? `GitHub rejected the write: ${outcome.errors[0]}`
           : 'Nothing was written and GitHub reported no reason.',
-        detail: 'A token needs Pull requests: Read and write to post a review. '
-          + 'A fine-grained token also has to list this repository under its access.',
+        // The overwhelmingly common cause, and the least obvious one: a
+        // fine-grained token created with Repository access = "Public
+        // repositories" is READ-ONLY by definition. GitHub does not even show
+        // a Repository permissions section for it, so there is no setting to
+        // change and nothing on screen says why writes fail.
+        detail: 'Fine-grained token: Repository access must be "Only select repositories" '
+          + '(or "All repositories") and include this repo — "Public repositories" is '
+          + 'read-only and can never post, which is why no Repository permissions section '
+          + 'appears for it. Then set Pull requests: Read and write. '
+          + 'Classic token: needs the repo scope (or public_repo for public repositories).',
         errors: outcome.errors,
         posted: outcome,
       });
