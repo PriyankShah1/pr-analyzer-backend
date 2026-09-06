@@ -1,7 +1,9 @@
 // routes/explain.js
 const express = require('express');
 const router  = express.Router();
+const crypto                   = require('crypto');
 const { rateLimit }            = require('../middleware/rateLimit');
+const { getCached, setCached } = require('../services/cacheService');
 const { generateExplanation }  = require('../services/aiService');
 const { isSupportedLanguage, listSupportedLanguages } = require('../services/languageConfig');
 
@@ -40,6 +42,24 @@ router.post('/', rateLimit, async (req, res) => {
     return res.status(400).json({ error: 'stats object is required' });
   }
 
+    // Keyed on the INPUTS, not the PR. This route is deliberately stateless —
+    // the client supplies all context — so there is no url to key on, and the
+    // same inputs must give the same answer anyway. Without this, flipping to
+    // a language, leaving the panel and coming back spent another model call
+    // for a translation we had already paid for.
+    const cacheKey = 'explain:' + crypto.createHash('sha1')
+      .update([
+        language, prTitle || '', codeLanguage || '',
+        String(stats.totalNodes ?? ''), String(stats.totalEdges ?? ''),
+        (codeContext || '').slice(0, 4000),
+      ].join('|'))
+      .digest('hex');
+
+    const cached = getCached(cacheKey);
+    if (cached) {
+      return res.json({ language, explanation: cached, fromCache: true });
+    }
+
   try {
     const explanation = await generateExplanation(language, {
       prTitle, codeLanguage, flows, stats, codeContext,
@@ -51,6 +71,7 @@ router.post('/', rateLimit, async (req, res) => {
       });
     }
 
+    setCached(cacheKey, explanation);
     return res.json({ language, explanation });
 
   } catch (error) {
