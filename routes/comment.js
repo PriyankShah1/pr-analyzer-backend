@@ -138,6 +138,12 @@ router.post('/', rateLimit, async (req, res) => {
     // review, which a reviewer does long after they stopped writing it.
     const threads = await fetchReviewThreads(octokit, repoInfo).catch(() => new Map());
 
+    // Located before the dry run so the preview can say how many summaries are
+    // on the PR. Every one of them is refreshed on a write — none is left
+    // stale — but duplicates are the reviewer's to delete, not ours: they are
+    // comments under their name on their PR.
+    const existingSummaries = demo ? [] : await findSummaryComments(octokit, repoInfo).catch(() => []);
+
     /**
      * The standing record of this review on the PR: every finding commented
      * on, and whether its thread is resolved.
@@ -292,6 +298,9 @@ router.post('/', rateLimit, async (req, res) => {
         // Everything this review has already put on the PR, with its current
         // state — the standing record, not just what is about to change.
         onPR,
+        // How many summary comments this PR carries. More than one is a
+        // leftover from before summaries were refreshed in place.
+        summaryCount: existingSummaries.length,
         // Say exactly what will happen, including whether a summary posts.
         // "Would post 0 inline comment(s), 1 summary, and mark 3 as resolved"
         // promised a summary that is now correctly skipped, and buried the one
@@ -332,7 +341,6 @@ router.post('/', rateLimit, async (req, res) => {
     }
 
     // Located so the summary can be refreshed in place rather than duplicated.
-    const existingSummaries = demo ? [] : await findSummaryComments(octokit, repoInfo).catch(() => []);
     const outcome = await executeCommentPlan(octokit, repoInfo, plan, {
       prHeadSha, existingSummaries,
     });
@@ -388,8 +396,9 @@ router.post('/', rateLimit, async (req, res) => {
       message: outcome.postedInline === 0 && alreadyPosted.length > 0
         ? `Already on this PR — ${alreadyPosted.length} finding(s) were commented on previously, so nothing was duplicated.`
         : `Posted ${outcome.postedInline} inline comment(s)`
-        + `${outcome.updatedSummaries > 0
-              ? ` and refreshed the summary`
+        + `${outcome.updatedSummaries > 1
+              ? ` and refreshed ${outcome.updatedSummaries} summaries`
+              : outcome.updatedSummaries === 1 ? ' and refreshed the summary'
               : outcome.postedSummary ? ' and a summary' : ''}`
         + `${outcome.markedResolved ? `, marked ${outcome.markedResolved} resolved` : ''}.`
         + `${outcome.errors.length > 0 ? ` ${outcome.errors.length} failed — see errors.` : ''}`,
