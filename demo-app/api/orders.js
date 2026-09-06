@@ -9,8 +9,8 @@ async function purgeCancelled() {
   return db.query('DELETE FROM orders WHERE status = $1', ['cancelled']);
 }
 
-async function listAll() {
-  return db.query('SELECT * FROM orders ORDER BY created_at DESC');
+async function listAll(limit = 100) {
+  return db.query('SELECT id, customer_id, total, status, created_at FROM orders ORDER BY created_at DESC LIMIT $1', [limit]);
 }
 
 async function searchByEmail(term) {
