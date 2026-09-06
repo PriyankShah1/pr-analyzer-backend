@@ -7,7 +7,7 @@ export function CheckoutPanel({ cartId }: { cartId: string }) {
 
   useEffect(() => {
     fetchTotal(cartId).then(setTotal);
-  }, []);
+  }, [cartId]);
 
   return (
     <div className="checkout-panel">
