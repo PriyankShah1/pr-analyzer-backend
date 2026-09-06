@@ -313,9 +313,12 @@ router.post('/', rateLimit, async (req, res) => {
               : 'Nothing to post — no finding in this analysis can be anchored to a diff line.';
           }
           if (posts === 0) {
+            // "in place" described the old body edit. GitHub's own resolve
+            // closes the thread and leaves the comment alone.
             return `Nothing new to post. ${marks} finding${marks === 1 ? '' : 's'} `
-              + `${marks === 1 ? 'has' : 'have'} been fixed — their existing comments will be `
-              + 'marked resolved in place.';
+              + `${marks === 1 ? 'has' : 'have'} been fixed — `
+              + `${marks === 1 ? 'its conversation' : 'their conversations'} `
+              + 'will be resolved on the PR.';
           }
           const parts = [`${posts} inline comment${posts === 1 ? '' : 's'}`, 'a summary'];
           const tail = marks > 0 ? `, and ${marks} marked resolved` : '';
