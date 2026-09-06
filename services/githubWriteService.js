@@ -384,6 +384,22 @@ function buildCommentPlan({
   // every one of them, so the PR ended up with the same table repeated 16
   // times. A partial review gets a one-line body naming what it contains.
   const planHasSummary = hasSummary;
+  /**
+   * Whether this plan puts a summary on the PR, decided HERE so the client can
+   * count it as a write.
+   *
+   * It used to be decided inside executeCommentPlan, which meant the dry run
+   * could not report it — and the confirm button, counting only comments and
+   * resolutions, stayed disabled while the server was perfectly willing to
+   * restore a summary someone had deleted.
+   */
+  const summaryIsOnlyDelivery = unanchored.length > 0;
+  const prAlreadyHasOurComments = alreadyPosted.length > 0 || toMarkResolved.length > 0;
+  const willPostSummary = inlineToPost.length > 0
+    || summaryIsOnlyDelivery
+    || !hasSummary                 // deleted, or never posted — this is a restore
+    || !prAlreadyHasOurComments;   // genuinely the first review
+
   const isPartial = selected !== null;
   const reviewBody = isPartial
     ? `🤖 **PR Analyzer** — ${inlineToPost.length} finding${inlineToPost.length === 1 ? '' : 's'} posted individually. `
@@ -392,6 +408,7 @@ function buildCommentPlan({
 
   return {
     isPartial,
+    willPostSummary,
     hasSummary: planHasSummary,
     reviewBody,
     inlineComments: inlineToPost.map(f => ({
@@ -419,6 +436,7 @@ function buildCommentPlan({
     counts: {
       willPostInline: inlineToPost.length,
       willMarkResolved: toMarkResolved.length,
+      willPostSummary,
       alreadyPosted: alreadyPosted.length,
       unanchored: unanchored.length,
       deselected: deselected.length,
@@ -654,7 +672,7 @@ async function executeCommentPlan(octokit, repoInfo, plan, { prHeadSha, existing
 
     // Refresh what is there. Only skip entirely when there is nothing on the
     // PR to refresh AND nothing new worth adding.
-    if (existing.length > 0 || !nothingNewToSay(plan)) {
+    if (existing.length > 0 || plan.willPostSummary) {
       await publishSummary(octokit, repoInfo, plan.summaryBody, existing, result);
     } else {
       result.skippedAsAlreadyPosted = true;

@@ -299,6 +299,10 @@ router.post('/', rateLimit, async (req, res) => {
         message: (() => {
           const posts = plan.counts.willPostInline;
           const marks = plan.counts.willMarkResolved;
+          if (posts === 0 && marks === 0 && plan.willPostSummary) {
+            return 'The review summary is missing from this PR — posting will put it back. '
+              + 'Every finding is already commented on.';
+          }
           if (posts === 0 && marks === 0) {
             // Terse is not the same as helpful. Report what IS on the PR, so
             // "nothing to do" reads as a finished state rather than a refusal.
