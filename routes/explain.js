@@ -1,5 +1,6 @@
 // routes/explain.js
 const express = require('express');
+const { lastGeminiFailure, isFatalGeminiFailure } = require('../services/geminiClient');
 const router  = express.Router();
 const crypto                   = require('crypto');
 const { rateLimit }            = require('../middleware/rateLimit');
@@ -66,8 +67,15 @@ router.post('/', rateLimit, async (req, res) => {
     });
 
     if (!explanation) {
+      // geminiClient already worked out WHY the call failed — a quota error, a
+      // missing key, a blocked response. Passing the generic sentence instead
+      // meant a user who had exhausted their Gemini quota saw only "Failed"
+      // and had no way to know a retry could not help.
+      const failure = lastGeminiFailure();
       return res.status(503).json({
-        error: 'AI explanation unavailable right now. Please try again later.',
+        error: failure?.message
+          || 'AI explanation unavailable right now. Please try again later.',
+        retryable: failure ? !isFatalGeminiFailure(failure) : true,
       });
     }
 
