@@ -1,0 +1,27 @@
+# Render Blueprint for the backend.
+#
+# GEMINI_API_KEY, GITHUB_TOKEN and ALLOWED_ORIGINS are marked sync:false so
+# Render prompts for them instead of storing secrets in the repository.
+services:
+  - type: web
+    name: pr-analyzer-api
+    runtime: node
+    rootDir: pr-analyzer
+    plan: free
+    buildCommand: npm ci
+    startCommand: node index.js
+    # Render restarts the service if this stops answering. It is also the
+    # first thing to curl after a deploy: it reports whether the token
+    # actually reached the process.
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Set to the deployed frontend origin, no trailing slash. Until this is
+      # right, the frontend loads and every request fails CORS.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
