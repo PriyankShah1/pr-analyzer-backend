@@ -56,7 +56,7 @@ function isSqlRelevantFile(filename) {
 // is position 1. Subsequent @@ headers themselves also consume a position.
 // Getting this off by one puts a reviewer's comment on the wrong line, so it
 // is computed explicitly here rather than inferred later.
-function extractAddedLinesWithPositions(patch) {
+function extractPatchLines(patch) {
   if (!patch) return [];
 
   const out = [];
@@ -80,16 +80,29 @@ function extractAddedLinesWithPositions(patch) {
     diffPosition += 1;
 
     if (raw.startsWith('+')) {
-      out.push({ line: newLineNo, diffPosition, hunkIndex, text: raw.slice(1) });
+      out.push({ line: newLineNo, diffPosition, hunkIndex, text: raw.slice(1), added: true });
       newLineNo += 1;
     } else if (raw.startsWith('-')) {
-      // Removed line: consumes a diff position but no new-file line.
+      // Removed line: consumes a diff position but no new-file line. Left out
+      // of the output entirely — deleted code must not affect brace depth.
     } else {
-      newLineNo += 1;          // context line
+      // Context. Unchanged, so nothing is ever REPORTED on it, but its braces
+      // are the only way to know where a loop body ENDS. Tracking depth over
+      // added lines alone let a loop stay open across the rest of the file.
+      out.push({ line: newLineNo, diffPosition, hunkIndex, text: raw.slice(1), added: false });
+      newLineNo += 1;
     }
   }
 
   return out;
+}
+
+function extractAddedLinesWithPositions(patch) {
+  // Same shape as before this was split out — callers outside this file
+  // (inline comment positioning) depend on it exactly.
+  return extractPatchLines(patch)
+    .filter(l => l.added)
+    .map(({ added, ...rest }) => rest);
 }
 
 // ── String literal scanner ────────────────────────────────────────────────
@@ -97,7 +110,16 @@ function extractAddedLinesWithPositions(patch) {
 // template literal contained an ${…} interpolation — that flag is what the
 // injection rule keys on. Escapes are honoured so a `\'` inside a string
 // doesn't terminate it early.
-function extractStringLiterals(blob) {
+/**
+ * Pull string literals out of a code blob.
+ *
+ * `isPhp` matters: in PHP a DOUBLE-quoted string interpolates `$var` and
+ * `{$var}` exactly the way a JS backtick interpolates `${var}`, while a
+ * single-quoted PHP string does not. Without it, the injection rule saw only
+ * JS template literals and missed every PHP injection — in a tool that claims
+ * to support Laravel, and on its only critical-severity rule.
+ */
+function extractStringLiterals(blob, isPhp = false) {
   const literals = [];
   let i = 0;
 
@@ -138,11 +160,50 @@ function extractStringLiterals(blob) {
         j = close === -1 ? blob.length : close + 1;
         continue;
       }
+      // PHP: "… {$user->id} …" — braced, may contain property/array access.
+      if (isPhp && quote === '"' && c === '$' && blob[j + 1] === '{') {
+        interpolated = true;
+        const close = blob.indexOf('}', j + 2);
+        value += '${…}';
+        j = close === -1 ? blob.length : close + 1;
+        continue;
+      }
+      if (isPhp && quote === '"' && c === '{' && blob[j + 1] === '$') {
+        interpolated = true;
+        const close = blob.indexOf('}', j + 2);
+        value += '${…}';
+        j = close === -1 ? blob.length : close + 1;
+        continue;
+      }
+      // PHP: "… $email …" — bare, runs to the end of the identifier.
+      if (isPhp && quote === '"' && c === '$' && /[A-Za-z_]/.test(blob[j + 1] || '')) {
+        interpolated = true;
+        let k = j + 1;
+        while (k < blob.length && /[A-Za-z0-9_]/.test(blob[k])) k += 1;
+        // A trailing -> or [ ] access is part of the same hole.
+        if (blob.slice(k, k + 2) === '->') {
+          k += 2;
+          while (k < blob.length && /[A-Za-z0-9_]/.test(blob[k])) k += 1;
+        }
+        value += '${…}';
+        j = k;
+        continue;
+      }
       value += c;
       j += 1;
     }
 
-    literals.push({ value, start, end: j, quote, interpolated });
+    // Concatenation is the other half of the same defect:
+    //   db.query('SELECT … WHERE id = ' + id)          (JS)
+    //   DB::select("SELECT … WHERE id = " . $id)       (PHP)
+    // Neither is a template literal, and both are injectable. Looking at what
+    // sits immediately after the closing quote is enough to tell.
+    const after = blob.slice(j + 1, j + 40);
+    const concatenated = isPhp
+      ? /^\s*\.\s*[$A-Za-z_]/.test(after)
+      : /^\s*\+\s*[A-Za-z_$]/.test(after);
+
+    literals.push({ value, start, end: j, quote, interpolated, concatenated });
     i = j + 1;
   }
 
@@ -165,13 +226,25 @@ function looksLikeSql(value) {
 // with ${…} holes already normalized in.
 
 function ruleInjection(sql, literal) {
-  if (!literal.interpolated) return null;
+  // Both forms build SQL out of a variable at runtime; only the syntax
+  // differs. Treating just the template-literal form as injection meant PHP
+  // interpolation and `'…' + id` concatenation went unreported entirely.
+  if (!literal.interpolated && !literal.concatenated) return null;
 
   // A hole is safe when it lands in a spot that cannot carry a predicate —
   // in practice only LIMIT/OFFSET numerics read that way, and even those we
   // only clear when the whole query has no WHERE to poison.
-  const holeInPredicate = /\b(WHERE|AND|OR|HAVING|VALUES|SET|IN)\b[^;]*\$\{…\}/i.test(sql);
-  const holeInIdentifier = /\b(FROM|JOIN|INTO|UPDATE)\s+\$\{…\}/i.test(sql);
+  // Placement is decided by where the ${…} marker sits. A CONCATENATED string
+  // has no marker — it simply ends where the variable is glued on — so the
+  // hole IS the end of the string:
+  //   'SELECT … WHERE id = ' + id   →   SELECT … WHERE id = ${…}
+  // Without this the concat form passed the interpolation check above and then
+  // failed here, which is why it stayed invisible even after the scanner
+  // learned to flag it.
+  const probe = literal.concatenated && !literal.interpolated ? `${sql} \${…}` : sql;
+
+  const holeInPredicate = /\b(WHERE|AND|OR|HAVING|VALUES|SET|IN)\b[^;]*\$\{…\}/i.test(probe);
+  const holeInIdentifier = /\b(FROM|JOIN|INTO|UPDATE)\s+\$\{…\}/i.test(probe);
   if (!holeInPredicate && !holeInIdentifier) return null;
 
   return {
@@ -299,34 +372,107 @@ const SQL_RULES = [
 
 // ── ORM rules (operate on code, not on SQL text) ──────────────────────────
 
-// Query-ish call sites, used by both the ORM rules and the N+1 detector.
+// Unambiguous query call sites.
 const QUERY_CALL_RE =
-  /\.(query|execute|raw|findMany|findAll|findOne|findUnique|findFirst|aggregate|count)\s*\(|\$queryRaw|\$executeRaw|DB::(select|statement|insert|update|delete|table|raw)|->(get|first|find|paginate)\s*\(/;
+  /\.(query|execute|raw|findMany|findAll|findOne|findUnique|findFirst|aggregate|count)\s*\(|\$queryRaw|\$executeRaw|DB::(select|statement|insert|update|delete|table|raw)/;
 
-const LOOP_OPENER_RE =
-  /\b(for|while)\s*\(|\.\s*(forEach|map|flatMap|filter|reduce)\s*\(|\bforeach\s*\(/;
+// `->get()`, `->first()`, `->find()` and `->paginate()` are Eloquent — and are
+// also Laravel's HTTP client, the cache, collections, and half the standard
+// library. Matching them on sight reported `Http::withUserAgent(...)->get($url)`
+// as a database round trip (koel/koel#2633), so they now need a query builder
+// somewhere in the same statement before they count.
+const AMBIGUOUS_PHP_QUERY_RE = /->(get|first|find|paginate)\s*\(/;
+const PHP_BUILDER_HINT_RE =
+  /DB::|->where[A-Za-z]*\s*\(|->orderBy\s*\(|->with\s*\(|->select\s*\(|->table\s*\(|->join\s*\(|->query\s*\(|::query\s*\(|::where[A-Za-z]*\s*\(|->newQuery\s*\(|Repository\b/;
+const PHP_NON_DB_RECEIVER_RE =
+  /\b(Http|Storage|Cache|Config|Session|Cookie|Redis|Log|Arr|Str|Route|View|Response|Request|File|Mail|Queue)::|\$request->|\bcollect\s*\(/;
+
+// `for`/`while`/`foreach` open a loop; nothing else reliably does. The
+// array-method family is ambiguous — `url.pathname.split('/').filter(Boolean)`
+// is a chained call on a string, not iteration over rows, and counting it
+// opened a "loop" that swallowed every query in the enclosing block
+// (documenso/documenso#3301). Require the callback syntax a real body has.
+const KEYWORD_LOOP_RE = /\b(for|while)\s*\(|\bforeach\s*\(/;
+const METHOD_LOOP_RE = /\.\s*(forEach|map|flatMap|filter|reduce)\s*\(/;
+const CALLBACK_RE = /=>|\bfunction\s*\(/;
+
+function isLoopOpener(text) {
+  if (KEYWORD_LOOP_RE.test(text)) return true;
+  return METHOD_LOOP_RE.test(text) && CALLBACK_RE.test(text);
+}
+
+/**
+ * Does the loop on this line open a block that later lines sit inside?
+ *
+ * A concise-body arrow — `fields.filter((f) => f.recipientId === id)` — is a
+ * loop whose body begins and ends on its own line. It has no braces, so brace
+ * tracking could never close it, and every query in the rest of the hunk
+ * looked like it was inside (documenso/documenso#3301, second finding).
+ */
+function opensBlock(hunkLines, i) {
+  const text = hunkLines[i].text;
+  const delta = (text.match(/\{/g) || []).length - (text.match(/\}/g) || []).length;
+  if (delta !== 0) return delta > 0;
+
+  // Allman style puts the brace on the next line.
+  for (let k = i + 1; k < hunkLines.length; k += 1) {
+    const t = hunkLines[k].text.trim();
+    if (t === '') continue;
+    return t.startsWith('{');
+  }
+  return false;
+}
+
+/** Is this line a database call? `stmt` is the statement it sits in. */
+function looksLikeQuery(text, stmt) {
+  if (QUERY_CALL_RE.test(text)) return true;
+  if (!AMBIGUOUS_PHP_QUERY_RE.test(text)) return false;
+  if (PHP_NON_DB_RECEIVER_RE.test(stmt)) return false;
+  return PHP_BUILDER_HINT_RE.test(stmt);
+}
 
 // `await` inside a loop over a query is the classic N+1: one round trip per
 // element. Async iteration primitives that fan out concurrently (Promise.all,
 // allSettled) are excluded — those are already a single logical batch.
-function detectNPlusOne(addedLines, filename) {
+function detectNPlusOne(hunkLines, filename) {
   const findings = [];
   let depth = 0;
   let loopDepth = null;
   let loopLine = null;
 
-  for (const entry of addedLines) {
+  for (let i = 0; i < hunkLines.length; i += 1) {
+    const entry = hunkLines[i];
     const text = entry.text;
 
-    if (loopDepth === null && LOOP_OPENER_RE.test(text)) {
+    if (loopDepth === null && isLoopOpener(text) && opensBlock(hunkLines, i)) {
       loopDepth = depth;
       loopLine = entry;
     }
 
-    if (loopDepth !== null && QUERY_CALL_RE.test(text) && /\bawait\b|->|DB::/.test(text)) {
+    // Reported only on ADDED lines: context is here to close braces, not to
+    // be commented on. A pre-existing loop with a newly added query inside it
+    // is still a new N+1, so the OPENER may be context.
+    if (loopDepth !== null && entry.added) {
+      // The statement, not just the line — a fluent chain puts the receiver
+      // that says whether this is a database call several lines above the
+      // `->get(` that matches.
+      const stmt = hunkLines.slice(Math.max(0, i - 3), i + 1).map(l => l.text).join('\n');
+
+      // A CAPPED query inside a `while` is batched pagination — the deliberate,
+      // recommended way to walk a large table — not an N+1. The options object
+      // sits BELOW the call, so this looks forward; the window above is
+      // backwards-only because a fluent chain puts its receiver above.
+      // strapi#27427 was reported on exactly this shape:
+      //   while (remaining > 0) { ...findMany({ ..., limit: batchLimit }) }
+      const forward = hunkLines
+        .slice(i, Math.min(hunkLines.length, i + 9)).map(l => l.text).join('\n');
+      const capped = /\b(limit|take)\s*:\s*[\w.]|->(limit|take|forPage)\s*\(/.test(forward);
+      const pagingLoop = /\bwhile\s*\(|\bfor\s*\(\s*;/.test(loopLine.text) && capped;
+
       // Same statement as the loop opener (e.g. `for (const r of await q())`)
       // is one query, not N.
-      if (entry.line !== loopLine.line) {
+      if (!pagingLoop
+          && looksLikeQuery(text, stmt) && /\bawait\b|->|DB::/.test(text) && entry.line !== loopLine.line) {
         findings.push(buildFinding({
           filename,
           entry,
@@ -340,8 +486,9 @@ function detectNPlusOne(addedLines, filename) {
       }
     }
 
-    // Crude brace tracking — enough to know when the loop body ended within
-    // a diff hunk, which is all this needs.
+    // Brace tracking. Correct now that context lines are included: before,
+    // the closing braces of the loop were usually unchanged and therefore
+    // invisible, so the loop never ended.
     depth += (text.match(/\{/g) || []).length;
     depth -= (text.match(/\}/g) || []).length;
     if (loopDepth !== null && depth <= loopDepth && /\}/.test(text)) {
@@ -354,27 +501,198 @@ function detectNPlusOne(addedLines, filename) {
 }
 
 // findMany/findAll with neither a row cap nor a projection: unbounded read.
-function detectUnboundedOrmReads(addedLines, filename) {
+// -- ORM query quality ----------------------------------------------------
+//
+// The nine rules above read raw SQL TEXT. A sweep of 573 real merged PRs found
+// raw SQL in a small minority of them and Eloquent in 60%, so those rules were
+// aimed at a code path modern applications barely use. These rules read the
+// ORM call SHAPE instead, which is where the queries actually are.
+//
+// Everything here is statement-aware, not line-aware: a builder chain is
+// routinely split across lines, so `->limit(10)` and `->get()` usually sit on
+// different ones, and a line-level check would call every bounded query
+// unbounded.
+
+/**
+ * The whole statement containing line `i`, as one string.
+ *
+ * Walks out from the line until a statement boundary, bounded so that a
+ * missing semicolon cannot swallow an entire file.
+ */
+function statementAround(hunkLines, i, maxSpan = 8) {
+  let start = i;
+  while (start > 0 && i - start < maxSpan) {
+    const prev = hunkLines[start - 1].text.trim();
+    if (prev === '' || /[;{}]$/.test(prev) || prev.startsWith('//') || prev.startsWith('*')) break;
+    start -= 1;
+  }
+  let end = i;
+  while (end < hunkLines.length - 1 && end - i < maxSpan) {
+    if (/;\s*$/.test(hunkLines[end].text)) break;
+    end += 1;
+  }
+  return hunkLines.slice(start, end + 1).map(l => l.text).join('\n');
+}
+
+// --- PHP / Eloquent ------------------------------------------------------
+
+// A terminal fetch: the point rows actually leave the database. `->get()` and
+// `::all()` with EMPTY parens only — `$request->get('key')` and
+// `Http::...->get($url)` take arguments and are not queries.
+const PHP_FETCH_RE = /->get\s*\(\s*\)|::all\s*\(\s*\)/;
+
+// Anything that caps or aggregates in SQL. Any of these means it is bounded.
+const PHP_BOUNDED_RE =
+  /->(limit|take|paginate|simplePaginate|cursorPaginate|forPage|first|firstOrFail|firstWhere|find|findOrFail|chunk|chunkById|cursor|lazy|lazyById|exists|doesntExist|count|sum|avg|max|min|value|pluck)\s*\(/;
+
+// `whereIn('id', $ids)` is bounded by an array the caller already holds in
+// memory, so the result cannot be larger than something already sized. Real
+// PRs are full of this shape — firefly-iii#12698 fired on it twice — and
+// flagging it is exactly the noise-on-every-review failure these rules have to
+// avoid. Counted as bounded even though it is not a LIMIT.
+const PHP_KEYED_RE = /->(whereIn|whereKey|whereIntegerInRaw|whereBetween)\s*\(/;
+
+// Reads with no filter of any kind: `Model::all()`, or a table read that
+// never narrows. These cannot be defended as "bounded by the owner" because
+// there is no owner in the query.
+const PHP_UNFILTERED_RE = /\b[A-Z]\w*::all\s*\(\s*\)|DB::table\s*\([^)]*\)\s*->get\s*\(\s*\)/;
+
+// Any narrowing at all. Custom Eloquent scopes (`->type(...)`, `->enabled()`)
+// are indistinguishable from ordinary chained calls, so anything that looks
+// like a scope call between the model and the fetch counts as a filter.
+const PHP_FILTER_RE = /->(where[A-Za-z]*|having[A-Za-z]*|scope[A-Za-z]*|forUser|enabled|active|type|visible|published)\s*\(|::where[A-Za-z]*\s*\(/;
+
+// Proof this is a query builder rather than some other fluent object.
+const PHP_QUERY_HINT_RE =
+  /\b[A-Z]\w*::(query|where[A-Za-z]*|with|all|select|orderBy|find)\s*\(|DB::table\s*\(|->where[A-Za-z]*\s*\(|->newQuery\s*\(|->join\s*\(|->orderBy\s*\(/;
+
+// Work done in PHP that the database could have done.
+const PHP_INMEMORY_FILTER_RE =
+  /->get\s*\(\s*\)\s*(?:\r?\n\s*)?->\s*(filter|reject|where[A-Za-z]*|firstWhere|search|contains)\s*\(/;
+const PHP_INMEMORY_AGGREGATE_RE =
+  /->get\s*\(\s*\)\s*(?:\r?\n\s*)?->\s*(count|sum|avg|average|max|min)\s*\(/;
+const PHP_INMEMORY_SORT_RE =
+  /->get\s*\(\s*\)\s*(?:\r?\n\s*)?->\s*(sortBy|sortByDesc|sort|shuffle)\s*\(/;
+
+// --- JS / TS ORMs --------------------------------------------------------
+
+const JS_FETCH_RE = /\.(findMany|findAll)\s*\(/;
+// TypeORM / Mongoose `.find({ ... })` — an OBJECT argument, never an array
+// callback, so this cannot match Array.prototype.find.
+const JS_OBJECT_FIND_RE = /\.find\s*\(\s*\{/;
+const JS_BOUNDED_RE = /\b(take|limit|first|skip)\s*:\s*[\w.[]/;
+// `where: { id: { in: ids } }` is bounded by an array the caller already holds
+// — the JS equivalent of Eloquent's whereIn. Not a LIMIT, but the result
+// cannot be larger than something already sized and in memory.
+// `id:` is matched whether the value is a literal array or a variable holding
+// one — `where: { id: attachmentIds }` is just as bounded as `id: [1, 2]`.
+// The \b matters: it must NOT match `userId:` or `teamId:`, which are ordinary
+// filters and bound nothing.
+// `In(ids)` is TypeORM's operator form of the same thing (n8n#37857 fired on
+// `where: { workflowId: In(workflowIds) }`, which is bounded by the argument).
+const JS_KEYED_RE = /\bin\s*:\s*[\w.[]|\bid\s*:\s*[\w.[]|\[Op\.in\]|\bIn\s*\(/;
+const JS_ORM_OPTION_RE = /\b(where|relations|include|select|orderBy|order)\s*:/;
+
+/**
+ * Reads that fetch an unbounded number of rows, and work done in application
+ * memory that belongs in the query.
+ */
+function detectOrmQueryQuality(hunkLines, filename) {
   const findings = [];
+  const isPhp = /\.php$/i.test(filename);
+  const seen = new Set();
 
-  for (const entry of addedLines) {
+  for (let i = 0; i < hunkLines.length; i += 1) {
+    const entry = hunkLines[i];
+    if (!entry.added) continue;             // report only on new code
     const text = entry.text;
-    if (!/\.(findMany|findAll)\s*\(/.test(text)) continue;
-    // An empty or near-empty call — `findMany()` / `findMany({})` — is the
-    // unambiguous case. Anything with options may cap rows on a later line,
-    // and we will not guess.
-    if (!/\.(findMany|findAll)\s*\(\s*\)?\s*\{?\s*\}?\s*\)/.test(text)) continue;
+    const stmt = statementAround(hunkLines, i);
 
-    findings.push(buildFinding({
-      filename,
-      entry,
-      kind: 'unbounded_orm_read',
-      severity: SEVERITY.HIGH,
-      title: 'Unbounded findMany/findAll',
-      detail: 'With no `take`/`limit` and no `select`, this loads every row and every column of the table into process memory. It is fine on a seeded dev database and an outage on a production one.',
-      suggestion: 'Add a row cap (`take: 100` / `limit: 100`) and a `select` listing only the fields used downstream.',
-      snippet: text.trim(),
-    }));
+    const push = (kind, severity, title, detail, suggestion) => {
+      const key = kind + ':' + entry.line;
+      if (seen.has(key)) return;
+      seen.add(key);
+      findings.push(buildFinding({
+        filename, entry, kind, severity, title, detail, suggestion,
+        snippet: text.trim(),
+      }));
+    };
+
+    if (isPhp) {
+      // Fetch-then-work-in-PHP is checked BEFORE the unbounded rule: it is the
+      // more specific diagnosis of the same statement.
+      // Anchored to the line holding the fetch, not merely to a line inside
+      // the statement — otherwise every line of a multi-line chain reports the
+      // same defect separately.
+      const fetchOnThisLine = /->get\s*\(\s*\)/.test(text);
+
+      if (fetchOnThisLine && PHP_INMEMORY_FILTER_RE.test(stmt)) {
+        push('in_memory_filter', SEVERITY.HIGH,
+          'Rows filtered in PHP instead of in the query',
+          'Every row of the result set is loaded into PHP and then thrown away by the filter. The database can apply this condition against an index and return only the rows that match.',
+          'Move the condition into the query - `->where(...)` before `->get()` - so the database does the filtering.');
+        continue;
+      }
+      if (fetchOnThisLine && PHP_INMEMORY_AGGREGATE_RE.test(stmt)) {
+        push('in_memory_aggregate', SEVERITY.HIGH,
+          'Aggregate computed in PHP over a full result set',
+          'This loads every row only to reduce it to a single number. The database computes the same value without transferring the rows.',
+          'Use the query aggregate instead - `->count()`, `->sum(...)`, `->avg(...)` - which runs in SQL and returns one value.');
+        continue;
+      }
+      if (fetchOnThisLine && PHP_INMEMORY_SORT_RE.test(stmt)) {
+        push('in_memory_sort', SEVERITY.MEDIUM,
+          'Result set sorted in PHP',
+          'Sorting after the fetch means the whole set is loaded before it can be ordered, and any limit applied afterwards has already paid for every row.',
+          'Order in the query - `->orderBy(...)` - so the database can use an index and a later limit is meaningful.');
+        continue;
+      }
+
+      // NARROWED after a 626-PR sweep. The wider version - "a fetch with no
+      // row cap" - fired five times and was wrong all five: every case was
+      // "fetch the rows belonging to ONE owner" (a user's folders, a
+      // dashboard's widgets, one accessory's acceptances, a type's
+      // categories). That is ordinary correct code, and flagging it is noise
+      // on every review, which is how a reviewer learns to ignore the tool.
+      //
+      // A filter bounds a query in practice even though it is not a LIMIT.
+      // What remains is the case with NO filter at all: `Model::all()` and a
+      // bare table read, where the row count is the whole table by
+      // construction and cannot be argued about.
+      // Anchored to the line that HOLDS the fetch, the same way the
+      // in-memory rules are. Testing only the statement window meant every
+      // line inside it reported — akaunting#3347 produced findings on a
+      // closing brace and on a blank line.
+      const unfilteredHere = /::all\s*\(\s*\)/.test(text) || fetchOnThisLine;
+
+      if (unfilteredHere
+          && PHP_UNFILTERED_RE.test(stmt)
+          && !PHP_BOUNDED_RE.test(stmt)
+          && !PHP_KEYED_RE.test(stmt)
+          && !PHP_FILTER_RE.test(stmt)) {
+        push('unbounded_orm_read', SEVERITY.HIGH,
+          'Query fetches every matching row',
+          'There is no row cap on this query, so the number of rows it returns is whatever the table holds. That is bounded on a development database and unbounded in production.',
+          'Add a cap - `->limit(100)` - or page the results with `->paginate()`; use `->chunk()` when the intent really is to walk the whole table.');
+        continue;
+      }
+      continue;
+    }
+
+    // --- JS / TS ---
+    const isFetch = JS_FETCH_RE.test(text)
+      || (JS_OBJECT_FIND_RE.test(text) && JS_ORM_OPTION_RE.test(stmt));
+    if (!isFetch) continue;
+    if (JS_BOUNDED_RE.test(stmt) || JS_KEYED_RE.test(stmt)) continue;
+    // Same narrowing as PHP: a `where` means the caller has scoped the read to
+    // something, and "all the widgets on this dashboard" is not a defect.
+    // Only a read with no filter at all is reported.
+    if (/\bwhere\s*:/.test(stmt)) continue;
+
+    push('unbounded_orm_read', SEVERITY.HIGH,
+      'Query fetches every matching row',
+      'With no `take`/`limit`, this returns every row that matches. A `where` clause bounds WHICH rows come back, not HOW MANY - the count still grows with the table.',
+      'Add a row cap (`take: 100` / `limit: 100`), and a `select` listing only the fields used downstream.');
   }
 
   return findings;
@@ -429,19 +747,28 @@ function analyzeSqlInFiles(files) {
     const filename = file.filename || '';
     if (!isSqlRelevantFile(filename) || !file.patch) continue;
 
-    const addedLines = extractAddedLinesWithPositions(file.patch);
+    const isPhpFile = /\.php$/i.test(filename);
+    const patchLines = extractPatchLines(file.patch);
+    const addedLines = patchLines.filter(l => l.added).map(({ added, ...rest }) => rest);
     if (addedLines.length === 0) continue;
 
     // Rules that need multi-line context run per hunk, so a loop in one hunk
     // can never be paired with a query in an unrelated hunk.
     const hunks = new Map();
+    const fullHunks = new Map();
     for (const entry of addedLines) {
       if (!hunks.has(entry.hunkIndex)) hunks.set(entry.hunkIndex, []);
       hunks.get(entry.hunkIndex).push(entry);
     }
+    // Added AND context, for the rules that need to know where a block ends.
+    for (const entry of patchLines) {
+      if (!fullHunks.has(entry.hunkIndex)) fullHunks.set(entry.hunkIndex, []);
+      fullHunks.get(entry.hunkIndex).push(entry);
+    }
 
-    for (const hunkLines of hunks.values()) {
-      findings.push(...detectNPlusOne(hunkLines, filename));
+    for (const [hunkIndex, hunkLines] of hunks.entries()) {
+      findings.push(...detectNPlusOne(fullHunks.get(hunkIndex), filename));
+      findings.push(...detectOrmQueryQuality(fullHunks.get(hunkIndex), filename));
 
       // Join the hunk so a template literal spanning several added lines is
       // seen as one string, then map any match back to its starting line.
@@ -462,7 +789,7 @@ function analyzeSqlInFiles(files) {
         return hunkLines[idx];
       };
 
-      for (const literal of extractStringLiterals(blob)) {
+      for (const literal of extractStringLiterals(blob, isPhpFile)) {
         if (!looksLikeSql(literal.value)) continue;
 
         const sql = literal.value.replace(/\s+/g, ' ').trim();
@@ -476,18 +803,28 @@ function analyzeSqlInFiles(files) {
       }
     }
 
-    findings.push(...detectUnboundedOrmReads(addedLines, filename));
   }
 
   // Two rules can legitimately fire on the same statement (SELECT * plus an
   // ORDER BY with no LIMIT, say) — those are distinct findings. Identical
   // fingerprints are not, and happen when the same query is added twice.
   const seen = new Set();
-  const deduped = findings.filter(f => {
+  let deduped = findings.filter(f => {
     if (seen.has(f.fingerprint)) return false;
     seen.add(f.fingerprint);
     return true;
   });
+
+  // A query inside a loop is ALSO an unbounded read, so both rules fire on the
+  // same line — two review comments on one query, saying overlapping things
+  // (seen on outline#13617). N+1 is the more specific and more actionable
+  // diagnosis, so it wins and the generic one is dropped for that line.
+  const nPlusOneLines = new Set(
+    deduped.filter(f => f.kind === 'n_plus_one_query').map(f => `${f.file}:${f.line}`),
+  );
+  deduped = deduped.filter(
+    f => !(f.kind === 'unbounded_orm_read' && nPlusOneLines.has(`${f.file}:${f.line}`)),
+  );
 
   return deduped.sort((a, b) => a.severityRank - b.severityRank || a.file.localeCompare(b.file) || a.line - b.line);
 }
@@ -496,6 +833,7 @@ module.exports = {
   analyzeSqlInFiles,
   isSqlRelevantFile,
   extractAddedLinesWithPositions,
+  extractPatchLines,
   fingerprintOf,
   SEVERITY,
   SEVERITY_RANK,
