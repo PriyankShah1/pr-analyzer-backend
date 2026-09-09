@@ -27,6 +27,10 @@ const MARKER_RE = /<!--\s*pr-analyzer:fp=([0-9a-f]{6,64})\s*-->/;
 
 // Hard caps. A PR with 200 findings should not produce 200 notifications.
 const MAX_INLINE_COMMENTS = 25;
+
+// Rows in the posted summary table. GitHub renders a longer one, but a
+// 200-row table buries the PR description.
+const SUMMARY_TABLE_ROWS = 50;
 const MAX_BODY_CHARS      = 60000;
 
 const SEVERITY_LABEL = {
@@ -122,7 +126,7 @@ function buildInlineBody(finding, editedDetail) {
   return lines.join('\n');
 }
 
-function buildSummaryBody({ anchored, unanchored, resolvedNow, prHeadSha }) {
+function buildSummaryBody({ anchored, unanchored, resolvedNow, prHeadSha, inlineTruncated = 0 }) {
   const total = anchored.length + unanchored.length;
   const counts = { critical: 0, high: 0, medium: 0, low: 0 };
   for (const f of [...anchored, ...unanchored]) {
@@ -144,11 +148,37 @@ function buildSummaryBody({ anchored, unanchored, resolvedNow, prHeadSha }) {
     lines.push(`**${total} risk${total === 1 ? '' : 's'} found** — ${chips}`, '');
 
     lines.push('| Severity | Issue | Location |', '|---|---|---|');
-    for (const f of [...anchored, ...unanchored].slice(0, 50)) {
+    const all = [...anchored, ...unanchored];
+    for (const f of all.slice(0, SUMMARY_TABLE_ROWS)) {
       const loc = f.line ? `\`${f.file}:${f.line}\`` : `\`${f.file}\``;
       lines.push(`| ${SEVERITY_EMOJI[f.severity]} ${SEVERITY_LABEL[f.severity]} | ${safeProse(f.title)} | ${loc} |`);
     }
     lines.push('');
+
+    // A table silently cut at 50 rows reads as the complete list. On a large
+    // PR that is a lie by omission: the reviewer has no way to know findings
+    // exist below the cut (B-ii).
+    const hidden = all.length - SUMMARY_TABLE_ROWS;
+    if (hidden > 0) {
+      lines.push(
+        `<sub>Showing the ${SUMMARY_TABLE_ROWS} highest-severity findings. `
+        + `**${hidden} more** ${hidden === 1 ? 'is' : 'are'} not listed here — `
+        + `open the PR in PR Analyzer to see all ${all.length}.</sub>`,
+        '',
+      );
+    }
+  }
+
+  // Same reasoning as the table cap: a reviewer seeing 25 inline comments has
+  // no way to know 35 more were held back (B-ii).
+  if (inlineTruncated > 0) {
+    lines.push(
+      `<sub>GitHub accepts a limited number of inline comments per review, so `
+      + `**${inlineTruncated}** further finding${inlineTruncated === 1 ? ' was' : 's were'} `
+      + `not posted inline. ${inlineTruncated === 1 ? 'It is' : 'They are'} in the table above; `
+      + `re-run the review after resolving some to post the rest.</sub>`,
+      '',
+    );
   }
 
   // Findings we could not tie to a specific added line are reported here
@@ -372,6 +402,7 @@ function buildCommentPlan({
   const summaryBody = buildSummaryBody({
     anchored,
     unanchored,
+    inlineTruncated: truncated,
     resolvedNow: toMarkResolved.map(r => ({
       title: extractTitleFromBody(r.body),
       file: extractPathFromBody(r.body),
@@ -403,6 +434,9 @@ function buildCommentPlan({
   const isPartial = selected !== null;
   const reviewBody = isPartial
     ? `🤖 **PR Analyzer** — ${inlineToPost.length} finding${inlineToPost.length === 1 ? '' : 's'} posted individually. `
+      + (truncated > 0
+        ? `${truncated} more could not be posted inline in this review. `
+        : '')
       + 'Run the full review for the complete summary.'
     : summaryBody;
 
