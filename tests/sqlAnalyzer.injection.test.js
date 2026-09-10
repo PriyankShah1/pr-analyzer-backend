@@ -125,5 +125,37 @@ check('severity is critical', f && f.severity === 'critical', f && f.severity);
 check('the hole is shown as a placeholder', f && /\$\{…\}/.test(f.snippet), f && f.snippet);
 check('it suggests parameterising', f && /parameteriz|parameter/i.test(f.suggestion), f && f.suggestion);
 
+console.log(NL + '5. A hole that CANNOT be attacker-controlled is not an injection');
+// twentyhq/twenty#25669 was reported as a CRITICAL injection for code that had
+// already done the right thing: the identifier cannot be parameterised, so it
+// was passed through escapeIdentifier(). Telling an author to fix what they
+// already fixed, on the most severe rule in the tool, is worse than silence.
+silent('escaped identifier + module constant', 'src/svc.ts', [
+  'const schemaName = escapeIdentifier(getWorkspaceSchemaName(workspaceId));',
+  'const rows = await this.coreDataSource.query(',
+  '  ' + BT + 'SELECT c.id, ' + D + '{CORE_COLUMNS} FROM core.x c JOIN ' + D + '{schemaName}.y wf ON wf.id = ' + D + '2' + BT + ',',
+  ');']);
+silent('a module constant alone', 'src/svc2.ts', [
+  'const q = ' + BT + 'SELECT ' + D + '{ORDER_COLUMNS} FROM orders WHERE id = ' + D + '1' + BT + ';']);
+silent('escaping written inside the hole', 'src/svc3.ts', [
+  'const q = ' + BT + 'SELECT id FROM ' + D + '{escapeIdentifier(t)}.x WHERE y = ' + D + '1' + BT + ';']);
+
+console.log(NL + '6. …but the escape must be real, and cover EVERY hole');
+fires('one hole escaped, the other raw', 'src/svc4.ts', [
+  'const schemaName = escapeIdentifier(s);',
+  'const r = await db.query(' + BT + 'SELECT id FROM ' + D + '{schemaName}.t WHERE email = ' + D + '{email}' + BT + ');'],
+  /interpolation/i);
+fires('assigned from a call that does not escape', 'src/svc5.ts', [
+  'const schemaName = getSchema(workspaceId);',
+  'const r = await db.query(' + BT + 'SELECT id FROM ' + D + '{schemaName}.t WHERE x = 1' + BT + ');'],
+  /interpolation/i);
+fires('escaper mentioned nearby but not assigned to this variable', 'src/svc6.ts', [
+  'log(escapeIdentifier(other), email);',
+  'const r = await db.query(' + BT + 'SELECT id FROM users WHERE email = ' + D + '{email}' + BT + ');'],
+  /interpolation/i);
+fires('a request parameter is never safe', 'src/svc7.ts', [
+  'const r = await db.query(' + BT + 'SELECT id FROM users WHERE id = ' + D + '{req.params.id}' + BT + ');'],
+  /interpolation/i);
+
 console.log(NL + pass + '/' + (pass + fail) + ' passed');
 process.exit(fail === 0 ? 0 : 1);

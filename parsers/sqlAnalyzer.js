@@ -144,6 +144,9 @@ function extractStringLiterals(blob, isPhp = false) {
     const start = i;
     let value = '';
     let interpolated = false;
+    // The expression inside each ${…}. The placeholder alone cannot tell a
+    // request parameter from an escaped identifier or a module constant.
+    const holes = [];
     let j = i + 1;
 
     while (j < blob.length) {
@@ -154,8 +157,10 @@ function extractStringLiterals(blob, isPhp = false) {
       if (quote !== '`' && c === '\n') break;
       if (quote === '`' && c === '$' && blob[j + 1] === '{') {
         interpolated = true;
-        // Record the hole as a placeholder so SQL structure stays readable.
+        // Record the hole as a placeholder so SQL structure stays readable,
+        // and keep the expression itself for the safety check.
         const close = blob.indexOf('}', j + 2);
+        holes.push(close === -1 ? '' : blob.slice(j + 2, close));
         value += '${…}';
         j = close === -1 ? blob.length : close + 1;
         continue;
@@ -203,7 +208,7 @@ function extractStringLiterals(blob, isPhp = false) {
       ? /^\s*\.\s*[$A-Za-z_]/.test(after)
       : /^\s*\+\s*[A-Za-z_$]/.test(after);
 
-    literals.push({ value, start, end: j, quote, interpolated, concatenated });
+    literals.push({ value, start, end: j, quote, interpolated, concatenated, holes });
     i = j + 1;
   }
 
@@ -225,7 +230,61 @@ function looksLikeSql(value) {
 // Each returns null (clean) or a partial finding. `sql` is the literal text
 // with ${…} holes already normalized in.
 
+/**
+ * Is every hole in this string demonstrably NOT attacker-controlled?
+ *
+ * Two shapes are safe and both are common in real code:
+ *
+ *   `${CORE_WORKFLOW_AGGREGATE_COLUMNS}` — a module constant, fixed at build
+ *   time and impossible to influence at runtime.
+ *
+ *   `${schemaName}` where `const schemaName = escapeIdentifier(...)` — an
+ *   identifier that cannot be parameterized, passed through the escaping the
+ *   rule would otherwise ask for. twentyhq/twenty#25669 was reported as a
+ *   critical injection for exactly this, which is telling an author to fix
+ *   what they already did correctly — on the most severe rule we have.
+ *
+ * A hole is only cleared on positive evidence. Anything unrecognised still
+ * counts as unsafe.
+ */
+const ESCAPER_RE = /escapeIdentifier|escapeLiteral|quoteIdent|escapeId|sqlEscape|escapeString/i;
+
+function holeIsSafe(expr, blob) {
+  const e = String(expr).trim();
+  if (!e) return false;
+
+  // A module constant: SCREAMING_SNAKE_CASE, no call, no member access.
+  if (/^[A-Z][A-Z0-9_]*$/.test(e)) return true;
+
+  // The escaping happens inside the hole itself.
+  if (ESCAPER_RE.test(e)) return true;
+
+  // Or on an earlier line: `const schemaName = escapeIdentifier(...)`.
+  //
+  // Scanned line by line rather than with a regex built from a string. Two
+  // separate attempts at the string-built version silently produced a literal
+  // backspace character from '\b' and dropped '\s' entirely, so the check
+  // never matched anything and the false positive stayed.
+  if (/^[A-Za-z_$][\w$]*$/.test(e) && blob) {
+    for (const line of String(blob).split('\n')) {
+      if (!ESCAPER_RE.test(line)) continue;
+      const at = line.indexOf(e);
+      if (at === -1) continue;
+      // It must be assigned TO, not merely mentioned: `<name> =`.
+      const before = at === 0 ? '' : line[at - 1];
+      const isWholeWord = !/[\w$]/.test(before);
+      if (isWholeWord && /^\s*=[^=]/.test(line.slice(at + e.length))) return true;
+    }
+  }
+
+  return false;
+}
+
 function ruleInjection(sql, literal) {
+  // Every hole accounted for as safe means there is nothing to inject through.
+  const holes = literal.holes || [];
+  if (holes.length > 0 && holes.every(h => holeIsSafe(h, literal.blob))) return null;
+
   // Both forms build SQL out of a variable at runtime; only the syntax
   // differs. Treating just the template-literal form as injection meant PHP
   // interpolation and `'…' + id` concatenation went unreported entirely.
@@ -790,6 +849,8 @@ function analyzeSqlInFiles(files) {
       };
 
       for (const literal of extractStringLiterals(blob, isPhpFile)) {
+        // Needed to see where a hole's variable came from.
+        literal.blob = blob;
         if (!looksLikeSql(literal.value)) continue;
 
         const sql = literal.value.replace(/\s+/g, ' ').trim();
