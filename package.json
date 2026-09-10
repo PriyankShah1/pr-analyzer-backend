@@ -4,7 +4,8 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node tests/sqlAnalyzer.nplus1.test.js && node tests/sqlAnalyzer.injection.test.js && node tests/sqlAnalyzer.ormQuality.test.js && node tests/writePlan.caps.test.js"
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",

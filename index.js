@@ -12,8 +12,15 @@ app.listen(port, () => {
   console.log(`📋 GitHub Token configured: ${!!process.env.GITHUB_TOKEN}`);
   console.log(`🔒 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
   console.log(`💾 Cache: TTL=${CACHE_TTL_MS / 60000}min, Max=${CACHE_MAX} entries`);
+  console.log(`🤖 Gemini configured: ${!!process.env.GEMINI_API_KEY}`);
   console.log(`\nEndpoints:`);
   console.log(`  GET  /health`);
   console.log(`  GET  /files?url=<PR_URL>`);
-  console.log(`  POST /analyze (body: { url, token? })\n`);
+  console.log(`  POST /analyze  (body: { url, token? })`);
+  console.log(`  POST /explain  (body: { url, language })`);
+  console.log(`  GET  /explain/languages`);
+  // Both write endpoints dry-run unless confirm:true — say so here, since
+  // this banner is the first thing anyone reads when wiring up a client.
+  console.log(`  POST /comment  (body: { url, token, confirm? })  — dry-run unless confirm:true`);
+  console.log(`  POST /commit   (body: { url, token, fingerprints[], confirm? })  — dry-run unless confirm:true\n`);
 });

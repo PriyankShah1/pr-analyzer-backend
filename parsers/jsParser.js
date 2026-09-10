@@ -80,6 +80,26 @@ const constructorParamRegex = /(?:private|protected|public|readonly)\s+(\w+)\s*:
 // Functional service call (no "this.")
 const funcServiceCallRegex = /\bawait\s+(\w+Service|\w+Repository|\w+Repo|\w+Manager|\w+Client|\w+Provider)\.(\w+)\s*\(/;
 
+// A plain top-level function declaration:  async function findOrders(id) {
+//
+// Only arrow functions assigned to a const were tracked, so a module written
+// as `async function foo()` had no enclosing name at all — every call inside
+// it was dropped, because a flow with no `from` cannot be drawn. That left an
+// entire file shape (plain functions talking to a database) missing from the
+// graph, and findings in those files had no node to jump to.
+const funcDeclRegex = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)\s*\(/;
+
+// A raw database client:  db.query(...)  pool.execute(...)  knex.raw(...)
+//
+// The ORM patterns above cover Prisma, Mongoose and TypeORM, but nothing
+// covered the plain driver. PHP already drew `Controller@method → DB::select`
+// for exactly this shape; JS drew nothing for `findOrders → db.query`.
+//
+// The receiver is restricted to names that really mean a database handle, so
+// this cannot match `res.query` or an arbitrary `.raw(`.
+const rawDbCallRegex =
+  /\b(db|database|conn|connection|pool|client|knex|sequelize|dataSource|datasource)\.(query|execute|raw|none|one|oneOrNone|many|any)\s*\(/;
+
 // ── ORM: Prisma ───────────────────────────────────────────────────────────
 const prismaRegex = /prisma\.(\w+)\.(create|findUnique|findFirst|findMany|update|updateMany|upsert|delete|deleteMany|count|aggregate)\s*\(/;
 
@@ -292,6 +312,16 @@ function parseJsFlow(files) {
         currentReturnType = null;
       }
 
+      // ── Plain function declaration ─────────────────────────────────────
+      // `async function findOrdersByCustomer(id) {` — a module of functions,
+      // which is how most non-framework JS is written. A class resets to null
+      // on its own line, so this only owns lines outside one.
+      const funcDeclMatch = line.match(funcDeclRegex);
+      if (funcDeclMatch && !currentClass) {
+        currentMethod     = funcDeclMatch[1];
+        currentReturnType = null;
+      }
+
       // ── Method detection (class-based, non-Nest) ────────────────────────
       const tsMethodMatch = line.match(tsMethodRegex);
       if (tsMethodMatch && currentClass && !pendingNestMethod) {
@@ -400,6 +430,19 @@ function parseJsFlow(files) {
         flows.push({
           from: fromLabel,
           to:   `prisma.${model}.${operation}`,
+          type: 'orm_call',
+          returnType: 'object',
+          file: file.filename,
+        });
+      }
+
+      // ── Raw database client calls ──────────────────────────────────────
+      const rawDbMatch = line.match(rawDbCallRegex);
+      if (rawDbMatch) {
+        const [, handle, operation] = rawDbMatch;
+        flows.push({
+          from: fromLabel,
+          to:   `${handle}.${operation}`,
           type: 'orm_call',
           returnType: 'object',
           file: file.filename,
